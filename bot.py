@@ -1,2421 +1,325 @@
 """
-Only Signals Bot — Version 2 (Production-ready single file)
-Architecture: per-user state, token tracking, independent new-token alerts, smart-money alerts, and manipulation alerts, developer contact
-Storage: JSON (schema ready for PostgreSQL migration)
-Deployment: Railway / any Python host
-
-FIXES vs previous version (V9):
-- token_detail callback: query.answer() is unconditional and first;
-  UI response uses context.bot.send_message() as primary path,
-  edit_message_text() is best-effort cleanup only.
-- pref| callback: same pattern — answer first, send_message primary,
-  no silent edit failures possible.
-- Both handlers are wrapped so every code path produces a visible response.
-
-FIXES in this version (V10 — callback resolution):
-- remember_token_ref(): always writes mapping entry unconditionally.
-  Removed internal db.save() — caller saves after building the full menu,
-  ensuring the mapping is persisted before any button can be tapped.
-- resolve_token_ref_robust(): added Fallback 2 — checks persisted
-  pending_track in the user record (db), so track_add / track_skip
-  buttons work correctly even after a bot restart or redeploy.
-- message_handler (search flow): pending_track is now persisted to the
-  user record (db.get_user(cid)["pending_track"]) in addition to
-  context.user_data. db.save() is called AFTER track_prompt_menu() is
-  built, guaranteeing the callback_token_map entry exists on disk before
-  the user can tap "Track this token" or "No thanks".
-- track_add / track_skip handlers: both now clear the persisted
-  pending_track from the user record (in addition to context.user_data)
-  to avoid stale data on subsequent searches.
-- pref| handler: added resolution-failure warning log so silent failures
-  are visible in production logs.
+بوت تيليجرام لإدارة متجر إلكتروني (نواة المرحلة الأولى — محل واحد).
+ملف واحد كامل: النموذج + التخزين + المطابقة + المعالجات + التشغيل.
+ 
+الإعداد قبل التشغيل:
+    1) احصل على التوكن من @BotFather عبر الأمر /newbot
+    2) احصل على معرّفك الرقمي من @userinfobot
+    3) اضبط متغيّري البيئة:
+         Windows (PowerShell):
+           $env:TELEGRAM_BOT_TOKEN = "توكنك_هنا"
+           $env:OWNER_CHAT_ID      = "معرفك_هنا"
+         Linux/Mac:
+           export TELEGRAM_BOT_TOKEN="توكنك_هنا"
+           export OWNER_CHAT_ID="معرفك_هنا"
+    4) ثبّت المكتبة:  pip install python-telegram-bot==21.6
+    5) شغّل:          python bot.py
+ 
+ملاحظة: يُنشأ ملف products.json تلقائياً في أول تشغيل.
 """
-
-print("=== DEPLOY MARKER V25-STARS-RECURRING-PAYLOAD ===")
-
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    PreCheckoutQueryHandler,
-    filters,
-)
-from telegram.helpers import escape_markdown
-print("=== DEPLOY MARKER V10-CALLBACK-RESOLUTION-FIX ===")
-import requests
-from datetime import datetime, timedelta
-import json
+ 
 import os
+import re
+import json
 import logging
-import asyncio
-from typing import Optional
-import hashlib
-
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
-TOKEN = os.getenv("BOT_TOKEN")
-OWNER_CHAT_ID = 760930914
-
-# Subscription / payments
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
-PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
-STARS_PRICE = int(os.getenv("STARS_PRICE", "500"))
-TRADER_STARS_PRICE = int(os.getenv("TRADER_STARS_PRICE", "150"))
-PRO_STARS_PRICE = int(os.getenv("PRO_STARS_PRICE", "500"))
-ELITE_STARS_PRICE = int(os.getenv("ELITE_STARS_PRICE", "1200"))
-PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x73c95943191fddc3e44fff22749c4ccc1ccc8a08")
-PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "BEP20 (BSC)")
-SUBSCRIPTION_PRICE_USDT = float(os.getenv("SUBSCRIPTION_PRICE_USDT", "10"))
-
-STARS_SUBSCRIPTION_PERIOD = int(os.getenv("STARS_SUBSCRIPTION_PERIOD", "2592000"))
-
-PLAN_CATALOG = {
-    "trader": {"label": "Trader", "rank": 1, "stars": TRADER_STARS_PRICE, "usdt": 5, "days": 30, "headline": "Fast alerts + cleaner execution", "features": ["⚡ Fast Alerts mode", "📦 Up to 15 tracked tokens", "🔔 Basic alerts with faster cadence", "🧪 Alpha Preview"]},
-    "pro": {"label": "Pro Alpha", "rank": 2, "stars": PRO_STARS_PRICE, "usdt": 10, "days": 30, "headline": "Decision edge for serious traders", "features": ["🐋 Smart Money Alerts", "⚠️ Manipulation Alerts", "📡 Real-time Signals", "🧬 Full Alpha Breakdown", "⚡/📊/📈 Alert modes"]},
-    "elite": {"label": "Elite", "rank": 3, "stars": ELITE_STARS_PRICE, "usdt": 25, "days": 30, "headline": "Priority intelligence + custom control", "features": ["⚙️ Custom Filters", "🚨 Priority signal framing", "📦 Up to 100 tracked tokens", "💬 Priority support", "Everything in Pro Alpha"]},
-}
-
-CHAIN_FILTER = "bsc"
-MIN_LIQUIDITY = 10000
-MIN_VOLUME = 5000
-CHECK_INTERVAL = 180
-MAX_ALERTS_PER_CYCLE = 1
-DATA_FILE = "bot_data.json"
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")  # optional, not required for the free data layer
-BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc-dataseed.bnbchain.org")
-GECKO_TERMINAL_BASE = os.getenv("GECKO_TERMINAL_BASE", "https://api.geckoterminal.com/api/v2")
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-AI_PRIMARY_PROVIDER = os.getenv("AI_PRIMARY_PROVIDER", "groq").strip().lower()
-AI_FALLBACK_PROVIDER = os.getenv("AI_FALLBACK_PROVIDER", "openrouter").strip().lower()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
-OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Quantara")
-AI_REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "25"))
-AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "300"))
-SMART_MONEY_CHECK_INTERVAL = 180
-SMART_MONEY_MIN_TOKEN_VALUE_USD = 1000.0
-SMART_MONEY_WALLETS = [
-    {"label": "Wallet 1", "address": "0x0000000000000000000000000000000000000001"},
-    {"label": "Wallet 2", "address": "0x0000000000000000000000000000000000000002"},
-    {"label": "Wallet 3", "address": "0x0000000000000000000000000000000000000003"},
-]
-
-SMART_MONEY_CLUSTER_WINDOW_SECONDS = 900
-SMART_MONEY_MIN_CLUSTER_WALLETS = 2
-SMART_MONEY_MAX_TOKEN_ALERTS_PER_CYCLE = 10
-
-# Per-token alert thresholds
-PRICE_CHANGE_ALERT_PCT = 10.0
-VOLUME_SPIKE_RATIO = 3.0
-LIQUIDITY_CHANGE_ALERT_PCT = 20.0
-TRACKED_BATCH_SLEEP_EVERY = 10
-TRACKED_BATCH_SLEEP_SECONDS = 2
-TRACKED_CHECK_MIN_BASELINE_SECONDS = 240
-
-# Market manipulation detection thresholds
-MANIPULATION_PRICE_SPIKE_PCT = 8.0
-MANIPULATION_VOLUME_SPIKE_RATIO = 3.0
-MANIPULATION_MIN_LIQUIDITY_USD = 10000.0
-MANIPULATION_MIN_VOLUME_USD = 25000.0
-MANIPULATION_BUY_SELL_RATIO = 4.0
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple
+ 
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters,
 )
-log = logging.getLogger(__name__)
-
-
-async def log_button_trace(context, cid, data, stage, extra=""):
-    msg = f"[BTN_TRACE] cid={cid} data={data} stage={stage} extra={extra}"
-    log.warning(msg)
-    # Debug trace stays in server logs only.
-
-
-async def safe_edit_message_text(query, context, *args, **kwargs):
-    """
-    Try query.edit_message_text() first. If Telegram rejects the edit
-    (400 Bad Request, message not modified, old message, etc.), fall back to
-    send_message so the user still sees a visible response.
-    """
-    try:
-        return await query.edit_message_text(*args, **kwargs)
-    except Exception as e:
-        log.warning(f"safe_edit_message_text fallback triggered: {e}")
-        text_arg = kwargs.get("text", args[0] if args else None)
-        if text_arg is None:
-            raise
-        send_kwargs = {}
-        for key in ("parse_mode", "reply_markup", "disable_web_page_preview"):
-            if key in kwargs:
-                send_kwargs[key] = kwargs[key]
-        return await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=text_arg,
-            **send_kwargs,
-        )
-
-
-# ─────────────────────────────────────────────
-# DATA SCHEMA
-# ─────────────────────────────────────────────
-
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def default_user(chat_id: int) -> dict:
-    now_dt = datetime.now()
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-    return {
-        "chat_id": chat_id,
-        "state": "idle",
-        "last_search_query": None,
-        "token_alerts": False,
-        "smart_money_alerts": False,
-        "manipulation_alerts": False,
-        "blocked": False,
-        "first_seen": now_str,
-        "last_active": now_str,
-        "trial_start": now_str,
-        "trial_end": (now_dt + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S"),
-        "is_paid": False,
-        "paid_until": None,
-        "subscription_plan": "free",
-        "subscription_tier": "free",
-        "payment_method": None,
-        "alert_mode": "normal",
-        "custom_filters": False,
-        "callback_token_map": {},
-    }
-
-
-def default_tracked_token(chat_id: int, token_key: str, symbol: str, name: str, chain: str) -> dict:
-    return {
-        "chat_id": chat_id,
-        "token_key": token_key,
-        "symbol": symbol,
-        "name": name,
-        "chain": chain,
-        "added_at": _now(),
-        "alerts": {
-            "price_change": True,
-            "volume_spike": True,
-            "liquidity_change": False,
-            "unusual_activity": False,
-        },
-        "last_price": None,
-        "last_volume": None,
-        "last_liquidity": None,
-        "last_checked": None,
-    }
-
-
-def parse_dt(value: str):
-    try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def is_trial_active(chat_id: int) -> bool:
-    user = db.get_user(chat_id) if "db" in globals() else None
-    if not user:
-        return False
-    trial_end = parse_dt(user.get("trial_end"))
-    return bool(trial_end and datetime.now() < trial_end)
-
-
-def is_paid_active(chat_id: int) -> bool:
-    user = db.get_user(chat_id) if "db" in globals() else None
-    if not user or not user.get("is_paid"):
-        return False
-    paid_until = parse_dt(user.get("paid_until"))
-    return bool(paid_until and datetime.now() < paid_until)
-
-
-def has_premium_access(chat_id: int) -> bool:
-    return is_trial_active(chat_id) or is_paid_active(chat_id)
-
-
-def trial_days_left(chat_id: int) -> int:
-    user = db.get_user(chat_id) if "db" in globals() else None
-    if not user:
-        return 0
-    trial_end = parse_dt(user.get("trial_end"))
-    if not trial_end:
-        return 0
-    delta = trial_end - datetime.now()
-    return max(0, delta.days + (1 if delta.seconds > 0 else 0))
-
-
-def build_payment_message() -> str:
-    return (
-        "💳 *Upgrade to Premium*\n\n"
-        f"After your *{TRIAL_DAYS}-day free trial*, premium access costs *{SUBSCRIPTION_PRICE_USDT:.0f} USDT / {PREMIUM_DAYS} days* or *{STARS_PRICE} Telegram Stars*.\n\n"
-        "*Premium unlocks:*\n"
-        "• 🐋 Smart Money Alerts\n"
-        "• ⚠️ Manipulation Alerts\n"
-        "• Priority intelligence layer\n\n"
-        f"*USDT option:*\nNetwork: {PAYMENT_NETWORK}\nAddress: `" + PAYMENT_WALLET + "`\n\n"
-        "⚠️ Only send USDT on the specified network.\n"
-        "If you prefer the easiest in-app payment, use Telegram Stars below."
-    )
-
-
-def trial_or_subscription_status(chat_id: int) -> str:
-    user = db.get_user(chat_id)
-    tier = user.get("subscription_tier", "free")
-    label = "Free" if tier == "free" else PLAN_CATALOG.get(tier, {}).get("label", tier.title())
-    if is_paid_active(chat_id):
-        return f"💎 {label} active until {user.get('paid_until')}"
-    if is_trial_active(chat_id):
-        return f"🆓 Trial active — {trial_days_left(chat_id)} day(s) left"
-    return "⛔ Trial ended — premium required for Smart Money and Manipulation"
-
-
-def current_user_tier(chat_id: int) -> str:
-    user = db.get_user(chat_id)
-    if is_paid_active(chat_id):
-        return user.get("subscription_tier", "pro")
-    if is_trial_active(chat_id):
-        return "trial"
-    return "free"
-
-
-def tier_rank_value(tier: str) -> int:
-    if tier == "trial":
-        return PLAN_CATALOG["pro"]["rank"]
-    if tier == "free":
-        return 0
-    return PLAN_CATALOG.get(tier, {}).get("rank", 0)
-
-
-def feature_allowed(chat_id: int, feature: str) -> bool:
-    tier = current_user_tier(chat_id)
-    rank = tier_rank_value(tier)
-    if feature in {"search", "basic_alerts", "my_tokens", "status", "alpha_preview", "alert_mode_basic"}:
+ 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+ 
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+PRODUCTS_FILE = "products.json"
+ 
+ 
+# ============================================================
+#  1) نموذج البيانات
+# ============================================================
+@dataclass
+class Product:
+    id: str
+    name: str
+    price: float
+    sizes: List[str]
+    stock: int
+    description: str
+ 
+ 
+# ============================================================
+#  2) طبقة التخزين (معزولة — يسهل استبدالها بقاعدة بيانات لاحقاً)
+# ============================================================
+class ProductRepository:
+    def __init__(self, filepath: str = PRODUCTS_FILE):
+        self.filepath = filepath
+        if not os.path.exists(self.filepath):
+            self._save([])
+ 
+    def _load(self) -> list:
+        with open(self.filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+ 
+    def _save(self, data: list):
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+ 
+    def get_all(self) -> List[Product]:
+        return [Product(**item) for item in self._load()]
+ 
+    def add(self, product: Product) -> bool:
+        data = self._load()
+        if any(item["id"].lower() == product.id.lower() for item in data):
+            return False
+        data.append(asdict(product))
+        self._save(data)
         return True
-    if feature == "fast_mode":
-        return rank >= 1
-    if feature in {"smart_money", "manipulation", "signals_realtime", "alpha_full"}:
-        return rank >= 2
-    if feature == "custom_filters":
-        return rank >= 3
-    return False
-
-
-def tracked_token_limit_for(chat_id: int) -> int:
-    tier = current_user_tier(chat_id)
-    if tier == "trial":
-        return 50
-    if tier == "elite":
-        return 100
-    if tier == "pro":
-        return 50
-    if tier == "trader":
-        return 15
-    return 5
-
-
-def alert_mode_label(mode: str) -> str:
-    return {"fast": "⚡ Fast", "normal": "📊 Normal", "long": "📈 Long-term"}.get(mode, "📊 Normal")
-
-
-def alert_check_interval_seconds(chat_id: int) -> int:
-    mode = db.get_user(chat_id).get("alert_mode", "normal")
-    if mode == "fast":
-        return 300
-    if mode == "long":
-        return 86400
-    return 10800
-
-
-
-
-def build_star_invoice_payload(plan_key: str, chat_id: int) -> str:
-    return f"stars_sub:{plan_key}:{chat_id}:{int(datetime.now().timestamp())}"
-
-
-def parse_star_invoice_payload(payload: str) -> dict:
-    parts = str(payload or "").split(":")
-    if len(parts) >= 4 and parts[0] == "stars_sub":
-        return {
-            "kind": parts[0],
-            "plan_key": parts[1],
-            "chat_id": parts[2],
-            "nonce": parts[3],
-        }
-    return {"kind": "unknown", "plan_key": "pro", "chat_id": None, "nonce": None}
-
-
-def payment_success_text(plan_label: str, recurring: bool, first_recurring: bool, expiration_ts) -> str:
-    base = f"✅ *{plan_label}* activated."
-    if recurring and first_recurring:
-        base += "\n\n🔁 Auto-renewal is now enabled via Telegram Stars."
-    elif recurring:
-        base += "\n\n🔁 Your recurring Telegram Stars subscription was renewed automatically."
-    if expiration_ts:
-        try:
-            exp_str = datetime.fromtimestamp(int(expiration_ts)).strftime("%Y-%m-%d %H:%M:%S")
-            base += f"\n⏳ Active until: *{exp_str}*"
-        except Exception:
-            pass
-    return base
-
-def premium_plan_card(plan_key: str) -> str:
-    plan = PLAN_CATALOG[plan_key]
-    body = "\n".join(f"• {item}" for item in plan["features"])
-    return f"*{plan['label']}*\n{plan['headline']}\nStars: *{plan['stars']}*  |  USDT: *{plan['usdt']}*  |  Days: *{plan['days']}*\n\n{body}"
-
-
-def build_subscription_hub(chat_id: int) -> str:
-    tier = current_user_tier(chat_id)
-    tier_label = "Free" if tier == "free" else ("Trial" if tier == "trial" else PLAN_CATALOG[tier]["label"])
-    return (
-        f"💎 *Quantara Subscription Hub*\n\nCurrent access: *{tier_label}*\nStatus: {trial_or_subscription_status(chat_id)}\n\n"
-        f"*Free keeps the bot useful:*\n• 📊 Prices / Search\n• 🔔 Basic Alerts\n• 📦 My Tokens\n\n"
-        f"*Premium sells decisions, not raw data:*\n• 🐋 Smart Money\n• ⚠️ Manipulation\n• 📡 Real-time Signals\n• ⚙️ Custom Filters\n• 🧬 Full Alpha Lab\n\n"
-        f"Choose the plan that matches your speed and edge."
-    )
-
-
-def alpha_components(pair: dict) -> dict:
-    liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
-    volume = safe_float((pair.get("volume") or {}).get("h24"))
-    buys = int(((pair.get("txns") or {}).get("h24") or {}).get("buys") or 0)
-    sells = int(((pair.get("txns") or {}).get("h24") or {}).get("sells") or 0)
-    price_change = safe_float((pair.get("priceChange") or {}).get("h24"))
-    score = 0
-    risk = 35
-    notes = []
-    if liquidity >= 100_000:
-        score += 28; notes.append("deep liquidity")
-    elif liquidity >= 30_000:
-        score += 18; notes.append("usable liquidity")
-    else:
-        risk += 15; notes.append("thin liquidity")
-    if volume >= 100_000:
-        score += 24; notes.append("strong volume")
-    elif volume >= 20_000:
-        score += 14; notes.append("moderate volume")
-    else:
-        risk += 10; notes.append("weak volume")
-    flow_ratio = buys / max(sells, 1)
-    if flow_ratio >= 1.8:
-        score += 18; notes.append("buy pressure")
-    elif flow_ratio < 0.8:
-        risk += 12; notes.append("sell pressure")
-    if -8 <= price_change <= 18:
-        score += 14; notes.append("healthy momentum")
-    elif price_change > 35:
-        risk += 18; notes.append("overextended move")
-    elif price_change < -20:
-        risk += 10; notes.append("heavy downside")
-    if liquidity > 0 and volume / max(liquidity, 1) > 3:
-        risk += 12; notes.append("volume/liquidity imbalance")
-    alpha = max(5, min(95, score))
-    risk = max(5, min(95, risk))
-    if alpha >= 75 and risk <= 45:
-        grade, verdict, action = "A", "Offensive", "Act fast if confirmation aligns"
-    elif alpha >= 60 and risk <= 60:
-        grade, verdict, action = "B", "Constructive", "Watch closely / size selectively"
-    elif alpha >= 45:
-        grade, verdict, action = "C", "Mixed", "Observe, do not chase"
-    else:
-        grade, verdict, action = "D", "Weak", "Avoid until structure improves"
-    probability = min(90, max(20, int(alpha - (risk * 0.35) + 20)))
-    return {"alpha": alpha, "risk": risk, "grade": grade, "verdict": verdict, "action": action, "probability": probability, "notes": notes, "price_change": price_change, "buys": buys, "sells": sells}
-
-
-def build_alpha_summary(pair: dict, premium: bool = False) -> str:
-    c = alpha_components(pair)
-    notes = ", ".join(c["notes"][:3]) if c["notes"] else "no clear edge"
-    text = (
-        f"🧬 *Alpha Summary*\n"
-        f"Alpha Score: *{c['alpha']}*/95\n"
-        f"Risk Score: *{c['risk']}*/95\n"
-        f"Grade: *{c['grade']}*  |  Probability: *{c['probability']}%*\n"
-        f"Verdict: *{c['verdict']}*\n"
-        f"Driver: {escape_markdown(notes, version=1)}\n"
-        f"Action: *{escape_markdown(c['action'], version=1)}*"
-    )
-    if premium:
-        text += f"\n\nBuy/Sell Flow: *{c['buys']} / {c['sells']}*\n24h Change: *{c['price_change']:.2f}%*"
-    return text
-
-
-
-
-
-def _pair_snapshot_for_ai(pair: dict) -> dict:
-    base = pair.get("baseToken") or {}
-    c = alpha_components(pair)
-    return {
-        "symbol": str(base.get("symbol") or "?"),
-        "name": str(base.get("name") or "?"),
-        "chain": str(pair.get("chainId") or "?").upper(),
-        "dex": str(pair.get("dexId") or "?"),
-        "price_usd": str(pair.get("priceUsd") or "N/A"),
-        "price_change_24h": safe_float((pair.get("priceChange") or {}).get("h24")),
-        "liquidity_usd": safe_float((pair.get("liquidity") or {}).get("usd")),
-        "volume_24h_usd": safe_float((pair.get("volume") or {}).get("h24")),
-        "buys_24h": int(((pair.get("txns") or {}).get("h24") or {}).get("buys") or 0),
-        "sells_24h": int(((pair.get("txns") or {}).get("h24") or {}).get("sells") or 0),
-        "alpha_score": c["alpha"],
-        "risk_score": c["risk"],
-        "grade": c["grade"],
-        "probability": c["probability"],
-        "verdict": c["verdict"],
-        "action": c["action"],
-        "notes": c["notes"][:4],
-    }
-
-
-def build_ai_prompt(pair: dict) -> str:
-    snap = _pair_snapshot_for_ai(pair)
-    return (
-        "You are a crypto trading signal explainer. "
-        "Write a concise trader-friendly insight in English only. "
-        "Do not mention that you are an AI. "
-        "Be concrete, practical, and conservative. "
-        "Return exactly these sections with short content:\n"
-        "Bias:\nRisk:\nWhat matters now:\nTrade stance:\n\n"
-        f"Token data: {json.dumps(snap, ensure_ascii=False)}"
-    )
-
-
-def _normalize_ai_text(text: str) -> str:
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return ""
-    cleaned = cleaned.replace("**", "*")
-    if len(cleaned) > 3500:
-        cleaned = cleaned[:3500].rstrip() + "\n\n…"
-    return cleaned
-
-
-def call_groq_ai(prompt: str) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "You explain crypto signals clearly for traders."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": AI_MAX_OUTPUT_TOKENS,
-    }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return _normalize_ai_text((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
-
-
-def call_openrouter_ai(prompt: str) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": "You explain crypto signals clearly for traders."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": AI_MAX_OUTPUT_TOKENS,
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    if OPENROUTER_SITE_URL:
-        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
-    if OPENROUTER_APP_NAME:
-        headers["X-Title"] = OPENROUTER_APP_NAME
-    r = requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return _normalize_ai_text((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
-
-
-def generate_ai_insight(pair: dict) -> tuple[str, str]:
-    prompt = build_ai_prompt(pair)
-    providers = [AI_PRIMARY_PROVIDER, AI_FALLBACK_PROVIDER]
-    tried = []
-    for provider in providers:
-        if not provider or provider in tried:
-            continue
-        tried.append(provider)
-        try:
-            if provider == "groq":
-                return call_groq_ai(prompt), "groq"
-            if provider == "openrouter":
-                return call_openrouter_ai(prompt), "openrouter"
-        except Exception as e:
-            log.warning(f"AI provider {provider} failed: {e}")
-            continue
-    raise RuntimeError("No AI provider returned a response. Configure GROQ_API_KEY and/or OPENROUTER_API_KEY.")
-# ─────────────────────────────────────────────
-# RUNTIME STATE
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# RUNTIME STATE
-# ─────────────────────────────────────────────
-
-seen_tokens: set = set()
-
-
-# ─────────────────────────────────────────────
-# PERSISTENT STATE
-# ─────────────────────────────────────────────
-
-class BotData:
-    def __init__(self):
-        self.users: dict = {}
-        self.tracked_tokens: dict = {}
-        self.search_history: list = []
-        self.search_counts: dict = {}
-        self.analyze_count: int = 0
-        self.last_alert_message: str = "No alerts yet"
-        self.last_check_time: str = "Not started yet"
-        self.smart_money_last_check_time: str = "Not started yet"
-        self.manipulation_last_check_time: str = "Not started yet"
-        self.smart_money_seen_hashes: dict = {}
-
-    # ── user helpers ──────────────────────────
-
-    def get_user(self, chat_id: int) -> dict:
-        key = str(chat_id)
-        if key not in self.users:
-            self.users[key] = default_user(chat_id)
-        return self.users[key]
-
-    def touch_user(self, chat_id: int):
-        u = self.get_user(chat_id)
-        u["last_active"] = _now()
-
-    def set_state(self, chat_id: int, state: str):
-        self.get_user(chat_id)["state"] = state
-
-    def get_state(self, chat_id: int) -> str:
-        return self.get_user(chat_id).get("state", "idle")
-
-    def set_last_search(self, chat_id: int, query: str):
-        self.get_user(chat_id)["last_search_query"] = query
-
-    def get_last_search(self, chat_id: int):
-        return self.get_user(chat_id).get("last_search_query")
-
-    def token_alerts_enabled(self, chat_id: int) -> bool:
-        return self.get_user(chat_id).get("token_alerts", False)
-
-    def set_token_alerts(self, chat_id: int, enabled: bool):
-        self.get_user(chat_id)["token_alerts"] = enabled
-
-    def token_alert_subscribers(self) -> list:
-        return [
-            int(uid) for uid, u in self.users.items()
-            if u.get("token_alerts") and not u.get("blocked")
-        ]
-
-    def smart_money_alerts_enabled(self, chat_id: int) -> bool:
-        return self.get_user(chat_id).get("smart_money_alerts", False)
-
-    def set_smart_money_alerts(self, chat_id: int, enabled: bool):
-        self.get_user(chat_id)["smart_money_alerts"] = enabled
-
-    def smart_money_subscribers(self) -> list:
-        return [
-            int(uid) for uid, u in self.users.items()
-            if u.get("smart_money_alerts") and not u.get("blocked")
-        ]
-
-    def manipulation_alerts_enabled(self, chat_id: int) -> bool:
-        return self.get_user(chat_id).get("manipulation_alerts", False)
-
-    def set_manipulation_alerts(self, chat_id: int, enabled: bool):
-        self.get_user(chat_id)["manipulation_alerts"] = enabled
-
-    def manipulation_subscribers(self) -> list:
-        return [
-            int(uid) for uid, u in self.users.items()
-            if u.get("manipulation_alerts") and not u.get("blocked")
-        ]
-
-    def premium_subscribers(self) -> list:
-        return [
-            int(uid) for uid, u in self.users.items()
-            if u.get("is_paid") and not u.get("blocked")
-        ]
-
-    def premium_active_count(self) -> int:
-        now = datetime.now()
-        count = 0
-        for u in self.users.values():
-            if not u.get("is_paid"):
-                continue
-            try:
-                paid_until = datetime.strptime(u.get("paid_until") or "", "%Y-%m-%d %H:%M:%S")
-                if paid_until > now:
-                    count += 1
-            except Exception:
-                continue
-        return count
-
-    # ── tracked token helpers ─────────────────
-
-    def track_token(self, chat_id: int, token_key: str, symbol: str, name: str, chain: str) -> dict:
-        key = f"{chat_id}:{token_key}"
-        if key not in self.tracked_tokens:
-            self.tracked_tokens[key] = default_tracked_token(chat_id, token_key, symbol, name, chain)
-        return self.tracked_tokens[key]
-
-    def untrack_token(self, chat_id: int, token_key: str):
-        key = f"{chat_id}:{token_key}"
-        self.tracked_tokens.pop(key, None)
-
-    def get_tracked(self, chat_id: int) -> list:
-        prefix = f"{chat_id}:"
-        return [v for k, v in self.tracked_tokens.items() if k.startswith(prefix)]
-
-    def get_tracked_token(self, chat_id: int, token_key: str):
-        return self.tracked_tokens.get(f"{chat_id}:{token_key}")
-
-    def set_alert_pref(self, chat_id: int, token_key: str, pref: str, value: bool):
-        entry = self.get_tracked_token(chat_id, token_key)
-        if entry:
-            entry["alerts"][pref] = value
-
-    # ── search helpers ────────────────────────
-
-    def record_search(self, chat_id: int, query: str):
-        cleaned = query.strip().lower()
-        if not cleaned:
-            return
-        self.search_history.append({
-            "chat_id": str(chat_id),
-            "query": cleaned,
-            "timestamp": _now(),
-        })
-        self.search_counts[cleaned] = self.search_counts.get(cleaned, 0) + 1
-        if len(self.search_history) > 5000:
-            self.search_history = self.search_history[-5000:]
-
-    def top_searches(self, limit=5) -> list:
-        return sorted(self.search_counts.items(), key=lambda x: x[1], reverse=True)[:limit]
-
-    def top_searches_recent(self, days=1, limit=5) -> list:
-        now = datetime.now()
-        counts: dict = {}
-        for item in self.search_history:
-            try:
-                dt = datetime.strptime(item["timestamp"], "%Y-%m-%d %H:%M:%S")
-                if now - dt <= timedelta(days=days):
-                    q = item["query"]
-                    counts[q] = counts.get(q, 0) + 1
-            except Exception:
-                continue
-        return sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
-
-    # ── activity helpers ──────────────────────
-
-    def active_users(self, days=1) -> int:
-        now = datetime.now()
-        count = 0
-        for u in self.users.values():
-            try:
-                dt = datetime.strptime(u.get("last_active", ""), "%Y-%m-%d %H:%M:%S")
-                if now - dt <= timedelta(days=days):
-                    count += 1
-            except Exception:
-                pass
-        return count
-
-    # ── persistence ───────────────────────────
-
-    def load(self):
-        global seen_tokens
-        if not os.path.exists(DATA_FILE):
-            return
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-
-            if "users" in raw:
-                self.users = raw.get("users", {})
-                for u in self.users.values():
-                    if "global_alerts" in u and "token_alerts" not in u:
-                        u["token_alerts"] = u.pop("global_alerts")
-                    if "smart_money_alerts" not in u:
-                        u["smart_money_alerts"] = False
-                    if "manipulation_alerts" not in u:
-                        u["manipulation_alerts"] = False
-                    if "trial_start" not in u:
-                        u["trial_start"] = _now()
-                    if "trial_end" not in u:
-                        u["trial_end"] = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-                    if "is_paid" not in u:
-                        u["is_paid"] = False
-                    if "paid_until" not in u:
-                        u["paid_until"] = None
-                    if "subscription_plan" not in u:
-                        u["subscription_plan"] = "free"
-                    if "subscription_tier" not in u:
-                        u["subscription_tier"] = "free"
-                    if "payment_method" not in u:
-                        u["payment_method"] = None
-                    if "alert_mode" not in u:
-                        u["alert_mode"] = "normal"
-                    if "custom_filters" not in u:
-                        u["custom_filters"] = False
-                self.tracked_tokens = raw.get("tracked_tokens", {})
-                self.search_history = raw.get("search_history", [])
-                self.search_counts = raw.get("search_counts", {})
-                self.analyze_count = raw.get("analyze_count", 0)
-                self.last_alert_message = raw.get("last_alert_message", "No alerts yet")
-                self.last_check_time = raw.get("last_check_time", "Not started yet")
-                self.smart_money_last_check_time = raw.get("smart_money_last_check_time", "Not started yet")
-                self.manipulation_last_check_time = raw.get("manipulation_last_check_time", "Not started yet")
-                self.smart_money_seen_hashes = raw.get("smart_money_seen_hashes", {})
-                seen_tokens = set(raw.get("seen_tokens", []))
-            else:
-                log.info("Migrating V1 data to V2 format...")
-                old_subs = set(raw.get("subscribers", []))
-                old_blocked = set(raw.get("blocked_users", []))
-                old_activity = raw.get("user_activity", {})
-
-                for cid_str in old_activity:
-                    cid = int(cid_str)
-                    u = self.get_user(cid)
-                    u["last_active"] = old_activity[cid_str]
-                    if cid in old_subs:
-                        u["token_alerts"] = True
-                    if cid in old_blocked:
-                        u["blocked"] = True
-
-                for cid in old_subs:
-                    u = self.get_user(cid)
-                    u["token_alerts"] = True
-
-                self.search_history = raw.get("search_history", [])
-                self.search_counts = raw.get("search_counts", {})
-                self.analyze_count = raw.get("analyze_count", 0)
-                self.last_alert_message = raw.get("last_alert_message", "No alerts yet")
-                self.smart_money_last_check_time = raw.get("smart_money_last_check_time", "Not started yet")
-                self.manipulation_last_check_time = raw.get("manipulation_last_check_time", "Not started yet")
-                self.smart_money_seen_hashes = raw.get("smart_money_seen_hashes", {})
-                seen_tokens = set(raw.get("seen_tokens", []))
-                log.info("V1 migration complete.")
-
-        except Exception as e:
-            log.error(f"Error loading data: {e}")
-
-    def save(self):
-        try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump({
-                    "users": self.users,
-                    "tracked_tokens": self.tracked_tokens,
-                    "search_history": self.search_history,
-                    "search_counts": self.search_counts,
-                    "analyze_count": self.analyze_count,
-                    "last_alert_message": self.last_alert_message,
-                    "last_check_time": self.last_check_time,
-                    "smart_money_last_check_time": self.smart_money_last_check_time,
-                    "manipulation_last_check_time": self.manipulation_last_check_time,
-                    "smart_money_seen_hashes": self.smart_money_seen_hashes,
-                    "seen_tokens": list(seen_tokens),
-                }, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            log.error(f"Error saving data: {e}")
-
-
-db = BotData()
-
-
-# ─────────────────────────────────────────────
-# DEXSCREENER API LAYER
-# ─────────────────────────────────────────────
-
-def dex_get(url: str, params: dict = None, timeout: int = 15):
-    try:
-        r = requests.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.Timeout:
-        log.warning(f"Timeout fetching {url}")
-    except requests.exceptions.HTTPError as e:
-        log.warning(f"HTTP error {e} for {url}")
-    except requests.exceptions.ConnectionError:
-        log.warning(f"Connection error for {url}")
-    except Exception as e:
-        log.warning(f"Unexpected error for {url}: {e}")
-    return None
-
-
-def get_latest_profiles() -> list:
-    data = dex_get("https://api.dexscreener.com/token-profiles/latest/v1")
-    if data and isinstance(data, list):
-        return data
-    return []
-
-
-def gecko_get(path: str, params: dict = None, timeout: int = 15):
-    try:
-        r = requests.get(f"{GECKO_TERMINAL_BASE}{path}", params=params, timeout=timeout, headers={"Accept": "application/json"})
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.warning(f"GeckoTerminal request failed for {path}: {e}")
-    return None
-
-
-def _to_dex_pair_from_gecko_pool(pool: dict) -> dict:
-    attrs = pool.get("attributes") or {}
-    relationships = pool.get("relationships") or {}
-    base_data = ((relationships.get("base_token") or {}).get("data") or {})
-    chain = str(attrs.get("network") or CHAIN_FILTER).lower()
-    price_usd = attrs.get("base_token_price_usd") or attrs.get("price_in_usd") or "0"
-    return {
-        "chainId": chain,
-        "dexId": attrs.get("dex_name") or "geckoterminal",
-        "url": attrs.get("reserve_in_usd") and f"https://www.geckoterminal.com/{chain}/pools/{pool.get('id','').split('_')[-1]}",
-        "priceUsd": price_usd,
-        "priceChange": {"h24": attrs.get("price_change_percentage", {}).get("h24") if isinstance(attrs.get("price_change_percentage"), dict) else attrs.get("price_percent_change_24h") or 0},
-        "liquidity": {"usd": attrs.get("reserve_in_usd") or 0},
-        "volume": {"h24": attrs.get("volume_usd", {}).get("h24") if isinstance(attrs.get("volume_usd"), dict) else attrs.get("volume_usd_24h") or 0},
-        "txns": {"h24": {"buys": (attrs.get("transactions") or {}).get("h24", {}).get("buys", 0) if isinstance(attrs.get("transactions"), dict) else 0,
-                          "sells": (attrs.get("transactions") or {}).get("h24", {}).get("sells", 0) if isinstance(attrs.get("transactions"), dict) else 0}},
-        "baseToken": {
-            "address": base_data.get("id", "").split('_')[-1] if base_data.get("id") else "",
-            "symbol": attrs.get("name", "?").split("/")[0].strip() if attrs.get("name") else "?",
-            "name": attrs.get("name", "?"),
-        },
-    }
-
-
-def gecko_search_pairs(q: str) -> list:
-    data = gecko_get("/search/pools", params={"query": q})
-    if not data or not isinstance(data, dict):
-        return []
-    pools = data.get("data") or []
-    out = []
-    for pool in pools[:10]:
-        try:
-            out.append(_to_dex_pair_from_gecko_pool(pool))
-        except Exception as e:
-            log.warning(f"Failed to normalize GeckoTerminal pool: {e}")
-    return out
-
-
-def gecko_get_token_pools(chain: str, addr: str) -> list:
-    data = gecko_get(f"/networks/{chain}/tokens/{addr}/pools")
-    if not data or not isinstance(data, dict):
-        return []
-    pools = data.get("data") or []
-    out = []
-    for pool in pools[:10]:
-        try:
-            out.append(_to_dex_pair_from_gecko_pool(pool))
-        except Exception as e:
-            log.warning(f"Failed to normalize GeckoTerminal token pool: {e}")
-    return out
-
-
-def search_pairs(q: str) -> list:
-    data = dex_get("https://api.dexscreener.com/latest/dex/search", params={"q": q})
-    if data and isinstance(data, dict):
-        pairs = data.get("pairs", []) or []
-        if pairs:
-            return pairs
-    return gecko_search_pairs(q)
-
-
-def get_token_pairs(chain: str, addr: str) -> list:
-    data = dex_get(f"https://api.dexscreener.com/token-pairs/v1/{chain}/{addr}")
-    if data and isinstance(data, list) and data:
-        return data
-    return gecko_get_token_pools(chain, addr)
-
-
-# ─────────────────────────────────────────────
-# TOKEN ANALYSIS
-# ─────────────────────────────────────────────
-
-def choose_best_pair(pairs: list):
-    if not pairs:
-        return None
-    return max(
-        pairs,
-        key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
-    )
-
-
-def fmt_money(v) -> str:
-    try:
-        v = float(v)
-    except Exception:
-        return "N/A"
-    if v >= 1_000_000:
-        return f"{v/1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"{v/1_000:.2f}K"
-    return f"{v:.2f}"
-
-
-def fmt_price(v) -> str:
-    try:
-        v = float(v)
-    except Exception:
-        return "N/A"
-    if v >= 1:
-        return f"{v:.4f}"
-    if v >= 0.01:
-        return f"{v:.6f}"
-    if v >= 0.0001:
-        return f"{v:.8f}"
-    return f"{v:.10f}".rstrip("0").rstrip(".")
-
-
-def safe_float(v, default=0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def analyze_pair(pair: dict) -> tuple:
-    liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
-    volume = safe_float((pair.get("volume") or {}).get("h24"))
-    buys = int(((pair.get("txns") or {}).get("h24") or {}).get("buys") or 0)
-    sells = int(((pair.get("txns") or {}).get("h24") or {}).get("sells") or 0)
-
-    score = 0
-    notes = []
-
-    if liquidity > 100_000:
-        score += 3
-        notes.append("very strong liquidity")
-    elif liquidity > 50_000:
-        score += 2
-        notes.append("strong liquidity")
-    elif liquidity > 10_000:
-        score += 1
-        notes.append("acceptable liquidity")
-    else:
-        notes.append("weak liquidity")
-
-    if volume > 100_000:
-        score += 3
-        notes.append("very strong volume")
-    elif volume > 50_000:
-        score += 2
-        notes.append("good volume")
-    elif volume > 10_000:
-        score += 1
-        notes.append("moderate volume")
-    else:
-        notes.append("weak volume")
-
-    if buys > sells:
-        score += 1
-        notes.append("buy pressure detected")
-    elif sells > buys * 2 and sells > 20:
-        notes.append("high sell pressure")
-
-    score_pct = min(score * 12, 100)
-
-    if score >= 7:
-        verdict = "🟢 Strong"
-    elif score >= 4:
-        verdict = "🟡 Medium"
-    else:
-        verdict = "🔴 Risk"
-
-    return verdict, notes, score_pct
-
-
-def build_scan_msg(pair: dict, header: str = "🧠 *Token Scan*") -> str:
-    base = pair.get("baseToken") or {}
-    verdict, notes, score_pct = analyze_pair(pair)
-    price_usd = pair.get("priceUsd", "N/A")
-    price_change = (pair.get("priceChange") or {}).get("h24", "N/A")
-    chain = escape_markdown(str(pair.get("chainId") or "N/A").upper(), version=1)
-    dex = escape_markdown(str(pair.get("dexId") or "N/A"), version=1)
-    symbol = escape_markdown(str(base.get("symbol", "N/A")), version=1)
-    name = escape_markdown(str(base.get("name", "N/A")), version=1)
-    url = pair.get("url", "")
-
-    link_line = f"\n🔗 [View on Dexscreener]({url})" if url else ""
-
-    return (
-        f"{header}\n\n"
-        f"🪙 *Token:* {symbol}\n"
-        f"📛 *Name:* {name}\n"
-        f"🔗 *Chain:* {chain}  |  *DEX:* {dex}\n"
-        f"💰 *Price:* ${fmt_price(price_usd)}\n"
-        f"📈 *24h Change:* {price_change}%\n"
-        f"💧 *Liquidity:* ${fmt_money((pair.get('liquidity') or {}).get('usd'))}\n"
-        f"📊 *Volume 24h:* ${fmt_money((pair.get('volume') or {}).get('h24'))}\n"
-        f"🎯 *Signal Score:* {score_pct}/100\n\n"
-        f"*Verdict:* {verdict}\n"
-        f"*Why:* {' | '.join(notes)}"
-        f"{link_line}"
-    )
-
-
-def extract_token_key(pair: dict) -> str:
-    chain = (pair.get("chainId") or "unknown").lower()
-    addr = (pair.get("baseToken") or {}).get("address", "")
-    if addr:
-        return f"{chain}:{addr.lower()}"
-    symbol = (pair.get("baseToken") or {}).get("symbol", "unknown").lower()
-    return f"{chain}:{symbol}"
-
-
-def parse_token_key(token_key: str) -> tuple[str, str]:
-    if ":" not in token_key:
-        return "", ""
-    chain, ident = token_key.split(":", 1)
-    return chain.strip().lower(), ident.strip().lower()
-
-
-def can_query_token_pairs(token_key: str) -> bool:
-    chain, ident = parse_token_key(token_key)
-    return bool(chain and ident and ident.startswith("0x"))
-
-
-def make_token_ref(token_key: str) -> str:
-    return hashlib.sha1(token_key.encode("utf-8")).hexdigest()[:12]
-
-
-def remember_token_ref(chat_id: int, token_key: str) -> str:
-    # FIX: always write the mapping entry unconditionally.
-    # Removed the internal db.save() — the caller is responsible for
-    # saving after building the full menu, avoiding redundant disk writes.
-    user = db.get_user(chat_id)
-    mapping = user.setdefault("callback_token_map", {})
-    ref = make_token_ref(token_key)
-    mapping[ref] = token_key
-    return ref
-
-
-def resolve_token_ref(chat_id: int, token_ref: str) -> str:
-    user = db.get_user(chat_id)
-    mapping = user.get("callback_token_map", {}) or {}
-    return mapping.get(token_ref, token_ref)
-
-
-def resolve_token_ref_robust(chat_id: int, token_ref: str, context=None) -> str:
-    """Resolve short callback refs reliably even after partial state loss.
-    Falls back to pending_track and all tracked tokens by recomputing refs.
+ 
+    def delete(self, product_id: str) -> bool:
+        data = self._load()
+        new_data = [i for i in data if i["id"].lower() != product_id.lower()]
+        if len(new_data) == len(data):
+            return False
+        self._save(new_data)
+        return True
+ 
+ 
+repo = ProductRepository()
+ 
+ 
+# ============================================================
+#  3) منطق المطابقة والفهم
+# ============================================================
+CODE_PATTERN = re.compile(r"\b[A-Za-z]{1,5}-\d{2,4}\b")
+ 
+# نية شراء صريحة فقط — لا كلمات استفهام عامة (كيف/متى/عندكم...)
+PURCHASE_KEYWORDS = [
+    "اشتري", "أشتري", "اشتريه", "اطلب", "أطلب", "اطلبه", "اطلبية",
+    "اوردر", "أوردر", "احجز", "أحجز", "احجزه", "order", "buy", "purchase",
+]
+ 
+ 
+def find_product(text: str, products: List[Product]) -> Tuple[Optional[Product], Optional[str]]:
     """
-    token_key = resolve_token_ref(chat_id, token_ref)
-    if token_key != token_ref:
-        return token_key
-
-    # Fallback 1: in-memory pending_track (works within the same bot session)
-    if context is not None:
-        pending = (getattr(context, "user_data", None) or {}).get("pending_track") or {}
-        pending_key = pending.get("token_key")
-        if pending_key and make_token_ref(pending_key) == token_ref:
-            return pending_key
-
-    # Fallback 2: persisted pending_track in user record (survives bot restarts)
-    persisted_pending = db.get_user(chat_id).get("pending_track") or {}
-    persisted_key = persisted_pending.get("token_key")
-    if persisted_key and make_token_ref(persisted_key) == token_ref:
-        remember_token_ref(chat_id, persisted_key)
-        return persisted_key
-
-    # Fallback 3: scan all tracked tokens by recomputing their refs
-    for entry in db.get_tracked(chat_id):
-        tk = entry.get("token_key")
-        if tk and make_token_ref(tk) == token_ref:
-            remember_token_ref(chat_id, tk)
-            return tk
-
-    return token_ref
-
-
-# ─────────────────────────────────────────────
-# KEYBOARDS / MENUS
-# ─────────────────────────────────────────────
-
-def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
-    enabled = db.token_alerts_enabled(chat_id)
-    toggle_label = "🔔 Basic Alerts: ON ✅" if enabled else "🔔 Basic Alerts: OFF ❌"
-    toggle_data = "token_alerts_off" if enabled else "token_alerts_on"
-    sm_enabled = db.smart_money_alerts_enabled(chat_id)
-    sm_label = "🐋 Smart Money: ON ✅" if sm_enabled else "🐋 Smart Money: OFF ❌"
-    sm_data = "smart_money_off" if sm_enabled else "smart_money_on"
-    manip_enabled = db.manipulation_alerts_enabled(chat_id)
-    manip_label = "⚠️ Manipulation: ON ✅" if manip_enabled else "⚠️ Manipulation: OFF ❌"
-    manip_data = "manipulation_off" if manip_enabled else "manipulation_on"
-    mode_label = alert_mode_label(db.get_user(chat_id).get("alert_mode", "normal"))
-
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Prices / Search", callback_data="search_prompt")],
-        [InlineKeyboardButton(toggle_label, callback_data=toggle_data), InlineKeyboardButton("📦 My Tokens", callback_data="my_tokens")],
-        [InlineKeyboardButton(f"⏱ Alert Mode: {mode_label}", callback_data="alert_mode_menu")],
-        [InlineKeyboardButton(sm_label, callback_data=sm_data)],
-        [InlineKeyboardButton(manip_label, callback_data=manip_data)],
-        [InlineKeyboardButton("🧬 Alpha Lab", callback_data="alpha_lab"), InlineKeyboardButton("🤖 AI Insight", callback_data="ai_insight")],
-        [InlineKeyboardButton("⚙️ Custom Filters", callback_data="custom_filters")],
-        [InlineKeyboardButton("💎 Upgrade", callback_data="subscribe_info"), InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt"), InlineKeyboardButton("❓ Help", callback_data="help")],
-    ])
-
-
-def track_prompt_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    # Legacy helper kept for compatibility; auto-tracking is now used after search.
-    remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([])
-
-
-def tracked_token_action_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    token_ref = remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove_confirm:{token_ref}")],
-        [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-    ])
-
-
-def token_delete_confirm_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    token_ref = remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"track_remove:{token_ref}"),
-            InlineKeyboardButton("❌ No", callback_data="back_main"),
-        ],
-    ])
-
-
-def my_tokens_menu(chat_id: int) -> InlineKeyboardMarkup:
-    tracked = db.get_tracked(chat_id)
-    if not tracked:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Search a Token", callback_data="search_prompt")]
-        ])
-    rows = []
-    for t in tracked:
-        label = f"{t['symbol']} ({t['chain'].upper()})"
-        token_ref = remember_token_ref(chat_id, t["token_key"])
-        rows.append([InlineKeyboardButton(label, callback_data=f"token_detail|{token_ref}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def payment_options_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🟡 Trader — {PLAN_CATALOG['trader']['stars']}⭐", callback_data="plan_trader")],
-        [InlineKeyboardButton(f"🔵 Pro Alpha — {PLAN_CATALOG['pro']['stars']}⭐", callback_data="plan_pro")],
-        [InlineKeyboardButton(f"🔴 Elite — {PLAN_CATALOG['elite']['stars']}⭐", callback_data="plan_elite")],
-        [InlineKeyboardButton("💸 Show USDT Payment Details", callback_data="subscribe_usdt")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-    ])
-
-
-def alert_mode_menu(chat_id: int) -> InlineKeyboardMarkup:
-    current = db.get_user(chat_id).get("alert_mode", "normal")
-    def row(mode: str, label: str):
-        prefix = "✅ " if current == mode else ""
-        return [InlineKeyboardButton(prefix + label, callback_data=f"mode_{mode}")]
-    return InlineKeyboardMarkup([
-        row("fast", "⚡ Fast Alerts"),
-        row("normal", "📊 Normal"),
-        row("long", "📈 Long-term"),
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-    ])
-
-
-def premium_gate_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Upgrade to Pro Alpha", callback_data="subscribe_info")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-    ])
-
-
-# ─────────────────────────────────────────────
-# SMART MONEY LAYER# ─────────────────────────────────────────────
-# SMART MONEY LAYER (BSC via BscScan)
-# ─────────────────────────────────────────────
-
-def normalize_address(addr: str) -> str:
-    return (addr or "").strip().lower()
-
-
-def smart_wallets() -> list:
-    cleaned = []
-    for item in SMART_MONEY_WALLETS:
-        addr = normalize_address(item.get("address", ""))
-        if addr.startswith("0x") and len(addr) == 42:
-            cleaned.append({"label": item.get("label", addr[-6:]), "address": addr})
-    return cleaned
-
-
-def bscscan_get(params: dict, timeout: int = 20):
-    # Optional explorer path. The free data layer does not require this key.
-    if not BSCSCAN_API_KEY:
-        return None
-    full_params = dict(params)
-    full_params["apikey"] = BSCSCAN_API_KEY
-    try:
-        r = requests.get("https://api.bscscan.com/api", params=full_params, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        status = str(data.get("status", ""))
-        message = str(data.get("message", ""))
-        result = data.get("result")
-        if status == "1" and isinstance(result, list):
-            return result
-        if isinstance(result, str) and "No transactions found" in result:
-            return []
-        if message.upper() == "OK" and isinstance(result, list):
-            return result
-        log.warning(f"bscscan_get: unexpected response: {data}")
-    except Exception as e:
-        log.warning(f"bscscan_get failed: {e}")
-    return None
-
-
-def get_wallet_token_transfers(address: str, offset: int = 10) -> list:
-    return bscscan_get({
-        "module": "account",
-        "action": "tokentx",
-        "address": address,
-        "sort": "desc",
-        "page": 1,
-        "offset": offset,
-    }) or []
-
-
-def infer_tx_side(wallet_address: str, tx: dict) -> str:
-    wallet = normalize_address(wallet_address)
-    from_addr = normalize_address(tx.get("from", ""))
-    to_addr = normalize_address(tx.get("to", ""))
-    if to_addr == wallet and from_addr != wallet:
-        return "buy"
-    if from_addr == wallet and to_addr != wallet:
-        return "sell"
-    return "transfer"
-
-
-def tx_token_amount(tx: dict) -> float:
-    try:
-        value = float(tx.get("value") or 0)
-        decimals = int(tx.get("tokenDecimal") or 0)
-        if decimals >= 0:
-            return value / (10 ** decimals) if decimals <= 30 else 0.0
-    except Exception:
-        pass
-    return 0.0
-
-
-def approximate_tx_usd_value(tx: dict) -> float:
-    amount = tx_token_amount(tx)
-    token_symbol = str(tx.get("tokenSymbol") or "").upper()
-    if token_symbol in {"USDT", "USDC", "BUSD", "DAI"}:
-        return amount
-    return 0.0
-
-
-def get_smart_money_token_key(tx: dict) -> str:
-    contract = normalize_address(tx.get("contractAddress", ""))
-    symbol = str(tx.get("tokenSymbol") or "?").upper().strip()
-    if contract.startswith("0x") and len(contract) == 42:
-        return f"bsc:{contract}"
-    return f"bsc:{symbol}"
-
-
-def classify_cluster_strength(wallet_count: int, unique_wallet_count: int) -> tuple[str, int]:
-    base_count = max(wallet_count, unique_wallet_count)
-    if base_count >= 6:
-        return "Very High", 90
-    if base_count >= 4:
-        return "High", 78
-    if base_count >= 3:
-        return "Medium", 66
-    return "Low", 52
-
-
-def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict, cluster_info: Optional[dict] = None) -> Optional[str]:
-    side = infer_tx_side(wallet_address, tx)
-    if side == "transfer":
-        return None
-
-    token_symbol = escape_markdown(str(tx.get("tokenSymbol") or "?"), version=1)
-    token_name = escape_markdown(str(tx.get("tokenName") or "?"), version=1)
-    contract = str(tx.get("contractAddress") or "")
-    amount = tx_token_amount(tx)
-    approx_usd = approximate_tx_usd_value(tx)
-    if approx_usd and approx_usd < SMART_MONEY_MIN_TOKEN_VALUE_USD:
-        return None
-
-    side_label = "🟢 BUY" if side == "buy" else "🔴 SELL"
-    wallet_label_safe = escape_markdown(wallet_label, version=1)
-    wallet_short = escape_markdown(wallet_address[:6] + "..." + wallet_address[-4:], version=1)
-    amount_text = f"{amount:,.4f}".rstrip("0").rstrip(".") if amount else "N/A"
-    usd_text = f"~${fmt_money(approx_usd)}" if approx_usd > 0 else "N/A"
-    bscscan_link = f"https://bscscan.com/tx/{tx.get('hash','')}" if tx.get("hash") else ""
-    token_link = f"https://dexscreener.com/bsc/{contract}" if contract else ""
-    links = []
-    if token_link:
-        links.append(f"[Chart]({token_link})")
-    if bscscan_link:
-        links.append(f"[Tx]({bscscan_link})")
-    links_line = " | ".join(links)
-    links_line = f"\n\n{links_line}" if links_line else ""
-
-    return (
-        f"🐋 *Smart Money Alert*\n\n"
-        f"Wallet: *{wallet_label_safe}* (`{wallet_short}`)\n"
-        f"Action: *{side_label}*\n"
-        f"Token: *{token_symbol}* — {token_name}\n"
-        f"Amount: `{escape_markdown(amount_text, version=1)}`\n"
-        f"Approx Value: `{escape_markdown(usd_text, version=1)}`\n"
-        f"Chain: *BSC*"
-        f"{links_line}"
-    )
-
-
-async def smart_money_check(token_key: str) -> dict:
-    # Free-data-layer compatible status report. Smart money can work later with
-    # optional explorer or RPC enrichment, but the core product no longer
-    # depends on a paid explorer API to search, score, or track tokens.
-    return {
-        "status": "optional_explorer" if BSCSCAN_API_KEY else "free_data_layer",
-        "tracked_wallets": len(smart_wallets()),
-        "confidence": 60 if BSCSCAN_API_KEY else 35,
-        "market_data": "DexScreener + GeckoTerminal",
-    }
-
-
-# ─────────────────────────────────────────────
-# MANIPULATION DETECTION LAYER
-# ─────────────────────────────────────────────
-
-def detect_manipulation_signal(last_price: float, current_price: float, last_volume: float, current_volume: float, current_liquidity: float, current_buys: int, current_sells: int) -> Optional[dict]:
-    if last_price <= 0 or last_volume <= 0:
-        return None
-    if current_liquidity < MANIPULATION_MIN_LIQUIDITY_USD or current_volume < MANIPULATION_MIN_VOLUME_USD:
-        return None
-
-    price_pct = ((current_price - last_price) / last_price) * 100 if last_price > 0 else 0.0
-    volume_ratio = current_volume / last_volume if last_volume > 0 else 0.0
-    buy_sell_ratio = current_buys / max(current_sells, 1)
-
-    if price_pct < MANIPULATION_PRICE_SPIKE_PCT:
-        return None
-    if volume_ratio < MANIPULATION_VOLUME_SPIKE_RATIO:
-        return None
-    if buy_sell_ratio < MANIPULATION_BUY_SELL_RATIO:
-        return None
-
-    risk_score = 55
-    risk_score += min(20, int((price_pct - MANIPULATION_PRICE_SPIKE_PCT) * 1.5))
-    risk_score += min(15, int((volume_ratio - MANIPULATION_VOLUME_SPIKE_RATIO) * 5))
-    if current_sells == 0:
-        risk_score += 10
-    risk_score = min(risk_score, 99)
-
-    return {
-        "price_pct": price_pct,
-        "volume_ratio": volume_ratio,
-        "buy_sell_ratio": buy_sell_ratio,
-        "risk_score": risk_score,
-    }
-
-
-def build_manipulation_alert(symbol: str, chain_display: str, dex_url: str, signal: dict, last_price: float, current_price: float, last_volume: float, current_volume: float, current_buys: int, current_sells: int) -> str:
-    footer = f"\n\n[View on Dexscreener]({dex_url})" if dex_url else ""
-    return (
-        f"⚠️ *Market Manipulation Warning — {symbol}*\n\n"
-        f"🔗 *Chain:* {chain_display}\n"
-        f"📈 *Price Spike:* +{signal['price_pct']:.1f}%  `${fmt_price(last_price)}` → `${fmt_price(current_price)}`\n"
-        f"🔥 *Volume Spike:* {signal['volume_ratio']:.1f}x  `${fmt_money(last_volume)}` → `${fmt_money(current_volume)}`\n"
-        f"🧪 *Buy Pressure:* {current_buys} buys vs {current_sells} sells\n"
-        f"🎯 *Risk Score:* {signal['risk_score']}/100\n\n"
-        f"*Interpretation:* sudden price and volume acceleration with concentrated buy pressure.\n"
-        f"*Recommendation:* avoid chasing the move until the token stabilizes."
-        f"{footer}"
-    )
-
-
-# ─────────────────────────────────────────────
-# INTERNAL HELPER — send alert settings message
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
-# COMMAND HANDLERS
-# ─────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.get_user(cid)
-    db.touch_user(cid)
-    db.save()
-
-    text = (
-        "🚀 *Quantara — Crypto Decision Engine*\n\n"
-        "Built to sell *decisions*, not raw data.\n\n"
-        "*Free Layer*\n"
-        "• 📊 Prices / Search\n"
-        "• 🔔 Basic Alerts\n"
-        "• 📦 My Tokens\n\n"
-        "*Premium Layer*\n"
-        "• 🐋 Smart Money\n"
-        "• ⚠️ Manipulation Detection\n"
-        "• 📡 Real-time Signals\n"
-        "• 🧬 Alpha Lab\n• 🤖 AI Insight\n"
-        "• ⚙️ Custom Filters\n\n"
-        "Choose an option below:"
-    )
-
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.touch_user(cid)
-
-    text = (
-        "❓ *Help — Only Signals V2*\n\n"
-        "*Commands:*\n"
-        "/start — launch the bot\n"
-        "/search — search a token\n"
-        "/mytokens — view your tracked tokens\n"
-        "/status — bot status\n"
-        "/analytics — owner-only metrics\n"
-        "/myid — show your chat ID\n/aiinsight — trader-style AI explanation for the last scan\n\n"
-        "*Core flow:*\n"
-        "1) Use `/search` or the Search button\n"
-        "2) Send token name / symbol / contract\n"
-        "3) Get a signal scan\n"
-        "4) Choose whether to track the token\n"
-        "5) Add it to My Tokens or remove it later\n6) Use *AI Insight* for a trader-style explanation\n\n"
-        "*Alert Modes:*\n"
-        "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
-        "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
-        "⚠️ *Manipulation Alerts* — optional warnings for tracked tokens showing pump-style conditions.\n"
-        "✅ You can enable any one of them *or all three together* from the main menu.\n\n"
-        f"🆓 Smart Money and Manipulation are included during your first *{TRIAL_DAYS}-day trial*. After that, premium payment is required.\n\n"
-        "⚠️ Signal scores are filters, not financial advice."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.touch_user(cid)
-
-    new_tokens_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
-    smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
-    manipulation_on = "Enabled ✅" if db.manipulation_alerts_enabled(cid) else "Disabled ❌"
-    tracked_count = len(db.get_tracked(cid))
-
-    manipulation_note = "\nℹ️ Manipulation alerts need at least one tracked token." if db.manipulation_alerts_enabled(cid) and tracked_count == 0 else ""
-
-    text = (
-        "📊 *Your Status*\n\n"
-        f"🔥 New Token Alerts: {new_tokens_on}\n"
-        f"🐋 Smart Money Alerts: {smart_money_on}\n"
-        f"⚠️ Manipulation Alerts: {manipulation_on}\n"
-        f"📌 Tokens Tracked: {tracked_count}{manipulation_note}\n\n"
-        f"*Bot Filters*\n"
-        f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
-        f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
-        f"📊 Min 24h Volume: ${MIN_VOLUME:,}\n"
-        f"⏱ New Token Last Check: {db.last_check_time}\n"
-        f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}\n"
-        f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
-    )
-
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-
-
-async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-
-    if cid != OWNER_CHAT_ID:
-        await update.message.reply_text("⛔ Owner only.")
+    يعيد (المنتج، نوع التطابق):
+      "code" = طابق كوداً صريحاً مثل SH-001 (الأدق)
+      "text" = طابق باسم المنتج
+      (None, None) = لا تطابق
+    """
+    # 1) مطابقة الكود الصريح أولاً
+    for match in CODE_PATTERN.findall(text):
+        for p in products:
+            if p.id.lower() == match.lower():
+                return p, "code"
+ 
+    # 2) مطابقة نصية بالاسم
+    text_lower = text.lower()
+    best, best_score = None, 0
+    for p in products:
+        score = sum(1 for word in p.name.lower().split() if word in text_lower)
+        if score > best_score:
+            best_score, best = score, p
+ 
+    if best_score >= 1:
+        return best, "text"
+    return None, None
+ 
+ 
+def has_purchase_intent(text: str) -> bool:
+    """نية شراء صريحة فقط؛ أسئلة الأسعار العادية ليست نية شراء."""
+    t = text.lower()
+    return any(kw in t for kw in PURCHASE_KEYWORDS)
+ 
+ 
+# ============================================================
+#  4) المعالجات (Handlers)
+# ============================================================
+ADD_ID, ADD_NAME, ADD_PRICE, ADD_SIZES, ADD_STOCK, ADD_DESC = range(6)
+ 
+ 
+def _is_owner(update: Update) -> bool:
+    return update.effective_user.id == OWNER_CHAT_ID
+ 
+ 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("أهلاً! أرسل اسم منتج أو كوده وسأردّ عليك فوراً.")
+ 
+ 
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
         return
-
-    global_subs = len(db.token_alert_subscribers())
-    smart_money_subs = len(db.smart_money_subscribers())
-    manipulation_subs = len(db.manipulation_subscribers())
-    total_users = len(db.users)
-    blocked_count = sum(1 for u in db.users.values() if u.get("blocked"))
-    tracked_total = len(db.tracked_tokens)
-    premium_active = db.premium_active_count()
-
-    top_all = db.top_searches(limit=5)
-    top_24h = db.top_searches_recent(days=1, limit=5)
-
-    top_all_text = "\n".join(f"  {q}: {c}x" for q, c in top_all) if top_all else "  None"
-    top_24h_text = "\n".join(f"  {q}: {c}x" for q, c in top_24h) if top_24h else "  None"
-
-    recent = sorted(db.users.values(), key=lambda u: u.get("last_active", ""), reverse=True)[:10]
-    recent_text = "\n".join(
-        f"  {u['chat_id']} — {u.get('last_active', 'N/A')}"
-        for u in recent
-    ) if recent else "  None"
-
-    text = (
-        "📈 *Owner Analytics*\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"🔥 New Token Alert Subscribers: {global_subs}\n"
-        f"🐋 Smart Money Subscribers: {smart_money_subs}\n"
-        f"⚠️ Manipulation Alert Subscribers: {manipulation_subs}\n"
-        f"📌 Total Tracked Tokens: {tracked_total}\n"
-        f"🚫 Blocked: {blocked_count}\n"
-        f"🧠 Total Analyses: {db.analyze_count}\n"
-        f"🔥 Active 24h: {db.active_users(1)}\n"
-        f"📆 Active 7d: {db.active_users(7)}\n\n"
-        f"🔎 *Top Searches (All Time)*\n{top_all_text}\n\n"
-        f"⚡ *Top Searches (24h)*\n{top_24h_text}\n\n"
-        f"👤 *Recently Active Users*\n{recent_text}"
-    )
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.set_state(cid, "awaiting_search")
-    db.touch_user(cid)
-    await update.message.reply_text("🔍 Send a token name, symbol, or contract address:")
-
-
-async def mytokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.touch_user(cid)
-    tracked = db.get_tracked(cid)
-
-    if not tracked:
-        await update.message.reply_text(
-            "📋 You have no tracked tokens yet.\n\nSearch a token first to start tracking.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")]
-            ])
-        )
+    products = repo.get_all()
+    if not products:
+        await update.message.reply_text("لا توجد منتجات.")
         return
-
-    text = "📋 *Your Tracked Tokens*\nTap a token to open actions.\n"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=my_tokens_menu(cid))
-
-
-async def contact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.set_state(cid, "awaiting_feedback")
-    db.touch_user(cid)
-    db.save()
-    await update.message.reply_text(
-        "💬 Send your message for the developer.\n\n"
-        "You can send:\n"
-        "- bug reports\n"
-        "- feature requests\n"
-        "- feedback\n\n"
-        "Type your message in the next reply."
-    )
-
-
-async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid != OWNER_CHAT_ID:
-        await update.message.reply_text("⛔ Owner only.")
+    lines = []
+    for p in products:
+        status = "✅" if p.stock > 0 else "❌"
+        lines.append(f"{status} {p.id} — {p.name} | {p.price} | مخزون: {p.stock}")
+    await update.message.reply_text("\n".join(lines))
+ 
+ 
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
         return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /reply <chat_id> <message>")
+    if not context.args:
+        await update.message.reply_text("الاستخدام: /delete SH-001")
         return
-
-    target_raw = context.args[0].strip()
-    if not target_raw.isdigit():
-        await update.message.reply_text("Invalid chat_id.")
-        return
-
-    target_chat_id = int(target_raw)
-    reply_text = " ".join(context.args[1:]).strip()
-    if not reply_text:
-        await update.message.reply_text("Message cannot be empty.")
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=target_chat_id,
-            text=f"💬 *Developer Reply*\n\n{escape_markdown(reply_text, version=1)}",
-            parse_mode="Markdown",
-        )
-        await update.message.reply_text("✅ Reply sent.")
-    except Exception as e:
-        log.warning(f"reply_command failed for {target_chat_id}: {e}")
-        await update.message.reply_text(f"❌ Failed to send reply: {e}")
-
-
-async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Your Chat ID: `{update.effective_chat.id}`",
-        parse_mode="Markdown",
-    )
-
-
-async def activatepaid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid != OWNER_CHAT_ID:
-        await update.message.reply_text("⛔ Owner only.")
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /activatepaid <chat_id> <days>")
-        return
-
-    try:
-        target_chat_id = int(context.args[0])
-        days = int(context.args[1])
-    except Exception:
-        await update.message.reply_text("Invalid chat_id or days.")
-        return
-
-    user = db.get_user(target_chat_id)
-    user["is_paid"] = True
-    user["paid_until"] = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    user["subscription_plan"] = f"manual_{days}d"
-    user["subscription_tier"] = "pro"
-    user["payment_method"] = "usdt_manual"
-    db.save()
-
-    await update.message.reply_text("✅ Premium activated manually.")
-    try:
-        await context.bot.send_message(
-            target_chat_id,
-            f"✅ *Payment confirmed*\n\nPremium access is now active for *{days} days*.",
-            parse_mode="Markdown",
-            reply_markup=main_menu_for(target_chat_id),
-        )
-    except Exception:
-        pass
-
-
-async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid != OWNER_CHAT_ID:
-        await update.message.reply_text("⛔ Owner only.")
-        return
-
-    if len(context.args) < 1:
-        await update.message.reply_text(
-            "Usage: /upgrade <chat_id> [plan] [days]\n"
-            "Example: /upgrade 123456789\n"
-            "Example: /upgrade 123456789 pro 30"
-        )
-        return
-
-    try:
-        target_chat_id = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Invalid chat_id.")
-        return
-
-    plan_key = (context.args[1].strip().lower() if len(context.args) >= 2 else "pro")
-    if plan_key not in PLAN_CATALOG:
-        await update.message.reply_text("Invalid plan. Use trader / pro / elite.")
-        return
-
-    try:
-        days = int(context.args[2]) if len(context.args) >= 3 else PLAN_CATALOG[plan_key]["days"]
-    except Exception:
-        await update.message.reply_text("Invalid days value.")
-        return
-
-    user = db.get_user(target_chat_id)
-    user["is_paid"] = True
-    user["paid_until"] = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    user["subscription_plan"] = f"manual_{plan_key}_{days}d"
-    user["subscription_tier"] = plan_key
-    user["payment_method"] = "admin_grant"
-    db.save()
-
-    plan_label = PLAN_CATALOG[plan_key]["label"]
-    await update.message.reply_text(f"✅ Upgraded {target_chat_id} to {plan_label} for {days} day(s).")
-    try:
-        await context.bot.send_message(
-            target_chat_id,
-            (
-                f"✅ *Admin Upgrade Applied*\n\n"
-                f"Your access has been upgraded to *{plan_label}* for *{days} days*.\n\n"
-                "Use /start to refresh your menu."
-            ),
-            parse_mode="Markdown",
-            reply_markup=main_menu_for(target_chat_id),
-        )
-    except Exception as e:
-        log.warning(f"upgrade_command: failed to notify {target_chat_id}: {e}")
-
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await search_command(update, context)
-
-
-
-async def aiinsight_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.touch_user(cid)
-    pair = context.user_data.get("last_pair")
-    if not pair:
-        await update.message.reply_text(
-            "🤖 AI Insight needs a recent token scan first. Use /search or Prices / Search, then run /aiinsight.",
-            reply_markup=main_menu_for(cid),
-        )
-        return
-    waiting = await update.message.reply_text("🤖 Generating AI insight...")
-    try:
-        insight, provider = generate_ai_insight(pair)
-        text = f"🤖 *AI Insight*\nProvider: *{escape_markdown(provider, version=1)}*\n\n{escape_markdown(insight, version=1)}"
-        await context.bot.send_message(
-            cid,
-            text,
-            parse_mode="Markdown",
-            reply_markup=main_menu_for(cid),
-        )
-    except Exception as e:
-        await context.bot.send_message(
-            cid,
-            f"❌ AI insight is unavailable right now.\n\nReason: `{escape_markdown(str(e), version=1)}`",
-            parse_mode="Markdown",
-            reply_markup=main_menu_for(cid),
-        )
-    try:
-        await waiting.delete()
-    except Exception:
-        pass
-
-
-async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.touch_user(cid)
-    await update.message.reply_text(
-        build_subscription_hub(cid),
-        parse_mode="Markdown",
-        reply_markup=payment_options_menu(),
-    )
-
-
-async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    db.set_token_alerts(cid, False)
-    db.touch_user(cid)
-    db.save()
-    await update.message.reply_text(
-        "🔥 New token alerts disabled. Smart Money and Manipulation modes stay exactly as you set them.",
-        reply_markup=main_menu_for(cid),
-    )
-
-
-# ─────────────────────────────────────────────
-# MESSAGE HANDLER — search flow
-# ─────────────────────────────────────────────
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    state = db.get_state(cid)
-
-    if state == "awaiting_feedback":
-        feedback_text = (update.message.text or "").strip()
-        if not feedback_text:
-            await update.message.reply_text("Please send a non-empty message.")
-            return
-
-        db.set_state(cid, "idle")
-        db.touch_user(cid)
-        db.save()
-
-        user = update.effective_user
-        username = f"@{user.username}" if user and user.username else "No username"
-        full_name = user.full_name if user else "Unknown user"
-
-        owner_message = (
-            "💬 *User Feedback / Support Message*\n\n"
-            f"*From:* {escape_markdown(full_name, version=1)}\n"
-            f"*Username:* {escape_markdown(username, version=1)}\n"
-            f"*Chat ID:* `{cid}`\n\n"
-            f"*Message:*\n{escape_markdown(feedback_text, version=1)}\n\n"
-            "Reply with:\n"
-            f"`/reply {cid} your message`"
-        )
-
-        delivery_ok = True
-        try:
-            await context.bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text=owner_message,
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            delivery_ok = False
-            log.warning(f"Failed to forward user feedback from {cid}: {e}")
-
-        if delivery_ok:
-            await update.message.reply_text(
-                "✅ Your message was sent to the developer.\n\n"
-                "You should receive a reply here if needed.",
-                reply_markup=main_menu_for(cid),
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Failed to send your message right now. Please try again later.",
-                reply_markup=main_menu_for(cid),
-            )
-        return
-
-    if state != "awaiting_search":
-        await update.message.reply_text(
-            "Use the menu or /search to look up a token, or use Contact Developer if you want support.",
-            reply_markup=main_menu_for(cid),
-        )
-        return
-
-    query_text = update.message.text.strip()
-    if not query_text:
-        await update.message.reply_text("Please send a token name or contract.")
-        return
-
-    db.set_state(cid, "idle")
-    db.touch_user(cid)
-    db.analyze_count += 1
-    db.record_search(cid, query_text)
-    db.save()
-
-    await update.message.reply_text("🔎 Searching...")
-
-    pairs = search_pairs(query_text)
-    if not pairs:
-        await update.message.reply_text(
-            "❌ No results found. Try a different name, symbol, or contract address.",
-            reply_markup=main_menu_for(cid),
-        )
-        return
-
-    filtered = [p for p in pairs if (p.get("chainId") or "").lower() == CHAIN_FILTER]
-    working_pairs = filtered if filtered else pairs
-
-    best = choose_best_pair(working_pairs)
-    if not best:
-        await update.message.reply_text("❌ No usable pairs found.", reply_markup=main_menu_for(cid))
-        return
-
-    scan_text = build_scan_msg(best)
-    context.user_data["last_pair"] = best
-    await update.message.reply_text(scan_text, parse_mode="Markdown", disable_web_page_preview=True)
-    await update.message.reply_text(build_alpha_summary(best, premium=feature_allowed(cid, "alpha_full")), parse_mode="Markdown")
-
-    token_key = extract_token_key(best)
-    symbol = (best.get("baseToken") or {}).get("symbol", "???")
-    name = (best.get("baseToken") or {}).get("name", "???")
-    chain = (best.get("chainId") or "unknown").lower()
-
-    # Persist the latest token reference for compatibility with older callback paths,
-    # even though the bot now auto-adds newly scanned tokens.
-    latest_track_data = {
-        "token_key": token_key,
-        "symbol": symbol,
-        "name": name,
-        "chain": chain,
-    }
-    context.user_data["pending_track"] = latest_track_data
-    db.get_user(cid)["pending_track"] = latest_track_data
-
-    existing = db.get_tracked_token(cid, token_key)
-    if not existing:
-        current_limit = tracked_token_limit_for(cid)
-        if len(db.get_tracked(cid)) >= current_limit:
-            await update.message.reply_text(
-                f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens.\n\n"
-                "Upgrade to increase your watchlist capacity.",
-                parse_mode="Markdown",
-                reply_markup=premium_gate_menu(),
-            )
-            db.save()
-            return
-
-        db.track_token(cid, token_key, symbol, name, chain)
-        db.save()
-
-        await update.message.reply_text(
-            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
-            "To remove it later:\n"
-            "1. Open *My Tokens*\n"
-            "2. Tap the token\n"
-            "3. Confirm deletion\n\n"
-            "This keeps your watchlist clean while you track active setups.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-            ]),
-        )
+    code = context.args[0]
+    if repo.delete(code):
+        await update.message.reply_text(f"✅ تم حذف {code}")
     else:
-        await update.message.reply_text(
-            f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*.\n\n"
-            "If you want to remove it later:\n"
-            "1. Open *My Tokens*\n"
-            "2. Tap the token\n"
-            "3. Confirm deletion",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-            ]),
-        )
-
-
-
-# ─────────────────────────────────────────────
-# CALLBACK HANDLER
-# ─────────────────────────────────────────────
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    cid = query.message.chat_id
-    data = query.data or ""
-    db.touch_user(cid)
-    await log_button_trace(context, cid, data, "ENTER")
-
+        await update.message.reply_text(f"لم أجد منتجاً بالكود {code}")
+ 
+ 
+# --- حوار إضافة منتج (لصاحب المحل) ---
+async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return ConversationHandler.END
+    await update.message.reply_text("أدخل كود المنتج (مثال: SH-001):")
+    return ADD_ID
+ 
+async def add_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["np"] = {"id": update.message.text.strip()}
+    await update.message.reply_text("أدخل اسم المنتج:")
+    return ADD_NAME
+ 
+async def add_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["np"]["name"] = update.message.text.strip()
+    await update.message.reply_text("أدخل السعر (رقم):")
+    return ADD_PRICE
+ 
+async def add_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await query.answer()
-    except Exception as e:
-        log.warning(f"button_handler: query.answer() failed for data={data!r}: {e}")
-
-    async def _render(text: str, reply_markup=None):
-        try:
-            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=reply_markup)
-        except Exception:
-            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=reply_markup)
-
-    if data == "search_prompt":
-        db.set_state(cid, "awaiting_search")
-        await context.bot.send_message(cid, "🔍 Send a token name, symbol, or contract address:")
-        return
-
-    if data == "back_main":
-        await _render("🚀 *Quantara — Crypto Decision Engine*\n\nChoose an option below:", main_menu_for(cid))
-        return
-
-    if data == "status":
-        new_tokens_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
-        smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
-        manipulation_on = "Enabled ✅" if db.manipulation_alerts_enabled(cid) else "Disabled ❌"
-        tracked_count = len(db.get_tracked(cid))
-        text = (
-            "📊 *Your Status*\n\n"
-            f"🔥 New Token Alerts: {new_tokens_on}\n"
-            f"🐋 Smart Money Alerts: {smart_money_on}\n"
-            f"⚠️ Manipulation Alerts: {manipulation_on}\n"
-            f"📌 Tokens Tracked: {tracked_count}\n\n"
-            f"⏱ Alert Mode: {alert_mode_label(db.get_user(cid).get('alert_mode', 'normal'))}\n"
-            f"⏱ New Token Last Check: {db.last_check_time}\n"
-            f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}\n"
-            f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
-        )
-        await _render(text, main_menu_for(cid))
-        return
-
-    if data == "help":
-        text = (
-            "❓ *Help*\n\n"
-            "Use *Prices / Search* to scan a token.\n"
-            "Tracked tokens appear in *My Tokens*.\n"
-            "Tap a tracked token to remove it if needed.\n\n"
-            "AI Insight explains the latest scan in trader language."
-        )
-        await _render(text, main_menu_for(cid))
-        return
-
-    if data == "contact_prompt":
-        db.set_state(cid, "awaiting_feedback")
-        await context.bot.send_message(
-            cid,
-            "💬 Send your message for the developer.\n\nType your message now.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")]]),
-        )
-        return
-
-    if data == "alert_mode_menu":
-        text = (
-            "⏱ *Alert Speed*\n\n"
-            "⚡ *Fast Alerts* — active trading\n"
-            "📊 *Normal* — balanced default\n"
-            "📈 *Long-term* — lower noise\n\n"
-            "Choose the mode that fits your workflow."
-        )
-        await _render(text, alert_mode_menu(cid))
-        return
-
-    if data in {"mode_fast", "mode_normal", "mode_long"}:
-        mode = data.split("_", 1)[1]
-        if mode == "fast" and not feature_allowed(cid, "fast_mode"):
-            await context.bot.send_message(cid, "⚡ *Fast Alerts* is available in Trader and above.", parse_mode="Markdown", reply_markup=premium_gate_menu())
-            return
-        db.get_user(cid)["alert_mode"] = mode
-        db.save()
-        await _render(f"✅ Alert mode set to *{alert_mode_label(mode)}*", main_menu_for(cid))
-        return
-
-    if data == "token_alerts_on":
-        db.set_token_alerts(cid, True)
-        db.save()
-        await _render("🔥 *Basic Alerts Enabled*", main_menu_for(cid))
-        return
-
-    if data == "token_alerts_off":
-        db.set_token_alerts(cid, False)
-        db.save()
-        await _render("🔕 *Basic Alerts Disabled*", main_menu_for(cid))
-        return
-
-    if data == "smart_money_on":
-        if not has_premium_access(cid):
-            await context.bot.send_message(cid, build_payment_message(), parse_mode="Markdown", reply_markup=payment_options_menu())
-            return
-        db.set_smart_money_alerts(cid, True)
-        db.save()
-        await _render("🐋 *Smart Money Alerts Enabled*", main_menu_for(cid))
-        return
-
-    if data == "smart_money_off":
-        db.set_smart_money_alerts(cid, False)
-        db.save()
-        await _render("🐋 *Smart Money Alerts Disabled*", main_menu_for(cid))
-        return
-
-    if data == "manipulation_on":
-        if not has_premium_access(cid):
-            await context.bot.send_message(cid, build_payment_message(), parse_mode="Markdown", reply_markup=payment_options_menu())
-            return
-        db.set_manipulation_alerts(cid, True)
-        db.save()
-        await _render("⚠️ *Manipulation Alerts Enabled*", main_menu_for(cid))
-        return
-
-    if data == "manipulation_off":
-        db.set_manipulation_alerts(cid, False)
-        db.save()
-        await _render("⚠️ *Manipulation Alerts Disabled*", main_menu_for(cid))
-        return
-
-    if data == "subscribe_info":
-        await _render(build_subscription_hub(cid), payment_options_menu())
-        return
-
-    if data == "subscribe_usdt":
-        await _render(build_payment_message(), payment_options_menu())
-        return
-
-    if data in {"plan_trader", "plan_pro", "plan_elite"}:
-        plan_key = data.split("_", 1)[1]
-        plan = PLAN_CATALOG[plan_key]
-        prices = [LabeledPrice(f"{plan['label']} - recurring every {plan['days']} days", plan["stars"])]
-        await context.bot.send_invoice(
-            chat_id=cid,
-            title=f"Quantara {plan['label']}",
-            description=f"{plan['headline']}\n\nTelegram Stars subscription billed every {plan['days']} days.",
-            payload=build_star_invoice_payload(plan_key, cid),
-            currency="XTR",
-            prices=prices,
-            subscription_period=STARS_SUBSCRIPTION_PERIOD,
-        )
-        return
-
-    if data == "alpha_lab":
-        last_pair = context.user_data.get("last_pair")
-        if not last_pair:
-            await context.bot.send_message(cid, "🧬 Alpha Lab needs a recent token scan first.", reply_markup=main_menu_for(cid))
-            return
-        premium = feature_allowed(cid, "alpha_full")
-        text = build_alpha_summary(last_pair, premium=premium)
-        if not premium:
-            text += "\n\n🔒 Full Alpha Breakdown is available in *Pro Alpha* and above."
-        await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
-        return
-
-    if data == "ai_insight":
-        last_pair = context.user_data.get("last_pair")
-        if not last_pair:
-            await context.bot.send_message(cid, "🤖 AI Insight needs a recent token scan first.", reply_markup=main_menu_for(cid))
-            return
-        wait_msg = None
-        try:
-            wait_msg = await context.bot.send_message(cid, "🤖 Generating AI insight...")
-            insight, provider = generate_ai_insight(last_pair)
-            response_text = (
-                "🤖 *AI Insight*\n"
-                f"Provider: *{escape_markdown(provider, version=1)}*\n\n"
-                f"{escape_markdown(insight, version=1)}"
-            )
-            await context.bot.send_message(cid, response_text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-        except Exception as e:
-            await context.bot.send_message(cid, f"❌ AI insight is unavailable right now.\n\nReason: `{escape_markdown(str(e), version=1)}`", parse_mode="Markdown", reply_markup=main_menu_for(cid))
-        finally:
-            if wait_msg:
-                try:
-                    await wait_msg.delete()
-                except Exception:
-                    pass
-        return
-
-    if data == "custom_filters":
-        if not feature_allowed(cid, "custom_filters"):
-            await context.bot.send_message(cid, "⚙️ *Custom Filters* are reserved for *Elite*.", parse_mode="Markdown", reply_markup=premium_gate_menu())
-            return
-        db.get_user(cid)["custom_filters"] = True
-        db.save()
-        await _render("⚙️ *Custom Filters unlocked*", main_menu_for(cid))
-        return
-
-    if data == "my_tokens":
-        tracked = db.get_tracked(cid)
-        if not tracked:
-            text = "📭 You have no tracked tokens yet.\n\nSearch a token first to start tracking."
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")],
-                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-            ])
-        else:
-            text = "📋 *Your Tracked Tokens*\nTap a token to manage it."
-            kb = my_tokens_menu(cid)
-        await _render(text, kb)
-        return
-
-    if data.startswith("token_detail|"):
-        token_ref = data.split("|", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        entry = db.get_tracked_token(cid, token_key)
-        if not entry:
-            await context.bot.send_message(cid, "⚠️ Token not found in your tracked list.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-            ]))
-            return
-        symbol_safe = escape_markdown(str(entry.get("symbol", "?")), version=1)
-        chain_safe = escape_markdown(str(entry.get("chain", "?")).upper(), version=1)
-        text = (
-            f"📌 *{symbol_safe}* — {chain_safe}\n\n"
-            "This token is currently in *My Tokens*.\n\n"
-            "Do you want to remove it from your watchlist?"
-        )
-        await _render(text, token_delete_confirm_menu(cid, token_key))
-        return
-
-    if data.startswith("track_remove_confirm:"):
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        entry = db.get_tracked_token(cid, token_key)
-        symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
-        text = (
-            f"🗑 *Remove {symbol_safe}?*\n\n"
-            "Press *Yes* to delete it from *My Tokens*.\n"
-            "Press *No* to return to the main menu."
-        )
-        await _render(text, token_delete_confirm_menu(cid, token_key))
-        return
-
-    if data.startswith("track_remove:"):
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        entry = db.get_tracked_token(cid, token_key)
-        symbol = entry["symbol"] if entry else token_key
-        db.untrack_token(cid, token_key)
-        context.user_data.pop("pending_track", None)
-        db.get_user(cid).pop("pending_track", None)
-        db.save()
-        await _render(f"🗑 *{escape_markdown(symbol, version=1)}* was removed from *My Tokens*.", main_menu_for(cid))
-        return
-
-    if data == "track_add_pending" or data.startswith("track_add:"):
-        pending = context.user_data.get("pending_track") or db.get_user(cid).get("pending_track") or {}
-        token_key = pending.get("token_key")
-        symbol = pending.get("symbol", "Token")
-        name = pending.get("name", symbol)
-        chain = pending.get("chain", "bsc")
-        if not token_key and data.startswith("track_add:"):
-            token_key = resolve_token_ref_robust(cid, data.split(":", 1)[1], context)
-        if not token_key:
-            await context.bot.send_message(cid, "⚠️ Could not identify the token to add. Please search again.", reply_markup=main_menu_for(cid))
-            return
-        existing = db.get_tracked_token(cid, token_key)
-        if not existing:
-            current_limit = tracked_token_limit_for(cid)
-            if len(db.get_tracked(cid)) >= current_limit:
-                await context.bot.send_message(cid, f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens.", parse_mode="Markdown", reply_markup=premium_gate_menu())
-                return
-            db.track_token(cid, token_key, symbol, name, chain)
-            text = f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*."
-        else:
-            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*."
-        context.user_data.pop("pending_track", None)
-        db.get_user(cid).pop("pending_track", None)
-        db.save()
-        await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-            [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-        ]))
-        return
-
-    if data == "track_skip_pending" or data.startswith("track_skip:"):
-        pending = context.user_data.get("pending_track") or db.get_user(cid).get("pending_track") or {}
-        token_key = pending.get("token_key")
-        symbol = pending.get("symbol", "Token")
-        if token_key and db.get_tracked_token(cid, token_key):
-            db.untrack_token(cid, token_key)
-            msg = f"🗑️ *{escape_markdown(symbol, version=1)}* was removed from *My Tokens*."
-        else:
-            msg = "👍 The token was not added to *My Tokens*."
-        context.user_data.pop("pending_track", None)
-        db.get_user(cid).pop("pending_track", None)
-        db.save()
-        await context.bot.send_message(cid, msg, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-        return
-
-    await context.bot.send_message(cid, "⚠️ Unknown option.", reply_markup=main_menu_for(cid))
-
-
-# ─────────────────────────────────────────────
-# PAYMENTS / ERRORS / JOBS / ENTRY POINT
-# ─────────────────────────────────────────────
-
-async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
-
-
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    payment = update.message.successful_payment
-    payload_data = parse_star_invoice_payload(getattr(payment, "invoice_payload", ""))
-    plan_key = payload_data.get("plan_key", "pro")
-    plan = PLAN_CATALOG.get(plan_key, PLAN_CATALOG["pro"])
-
-    user = db.get_user(cid)
-    expiration_ts = getattr(payment, "subscription_expiration_date", None)
-    is_recurring = bool(getattr(payment, "is_recurring", False))
-    is_first_recurring = bool(getattr(payment, "is_first_recurring", False))
-
-    user["is_paid"] = True
-    if expiration_ts:
-        user["paid_until"] = datetime.fromtimestamp(int(expiration_ts)).strftime("%Y-%m-%d %H:%M:%S")
+        context.user_data["np"]["price"] = float(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("أدخل رقماً صحيحاً:")
+        return ADD_PRICE
+    await update.message.reply_text("أدخل المقاسات مفصولة بفاصلة (مثال: S,M,L,XL):")
+    return ADD_SIZES
+ 
+async def add_get_sizes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["np"]["sizes"] = [s.strip() for s in update.message.text.split(",") if s.strip()]
+    await update.message.reply_text("أدخل الكمية المتوفرة:")
+    return ADD_STOCK
+ 
+async def add_get_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["np"]["stock"] = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("أدخل عدداً صحيحاً:")
+        return ADD_STOCK
+    await update.message.reply_text("أدخل وصف المنتج:")
+    return ADD_DESC
+ 
+async def add_get_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["np"]["description"] = update.message.text.strip()
+    product = Product(**context.user_data.pop("np"))
+    if repo.add(product):
+        await update.message.reply_text(f"✅ تمت إضافة {product.name}")
     else:
-        user["paid_until"] = (datetime.now() + timedelta(days=plan["days"])).strftime("%Y-%m-%d %H:%M:%S")
-    user["subscription_plan"] = f"stars_recurring_{plan_key}" if is_recurring else f"stars_{plan_key}"
-    user["subscription_tier"] = plan_key
-    user["payment_method"] = "telegram_stars_recurring" if is_recurring else "telegram_stars"
-    user["last_telegram_payment_charge_id"] = getattr(payment, "telegram_payment_charge_id", None)
-    user["last_invoice_payload"] = getattr(payment, "invoice_payload", None)
-    db.save()
-
-    await update.message.reply_text(
-        payment_success_text(plan["label"], is_recurring, is_first_recurring, expiration_ts),
-        parse_mode="Markdown",
-        reply_markup=main_menu_for(cid),
+        await update.message.reply_text(f"الكود {product.id} مستخدم مسبقاً.")
+    return ConversationHandler.END
+ 
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("np", None)
+    await update.message.reply_text("تم إلغاء الإضافة.")
+    return ConversationHandler.END
+ 
+ 
+# --- رسائل الزبائن ---
+def _format_product_reply(product: Product) -> str:
+    sizes_str = "، ".join(product.sizes) if product.sizes else "—"
+    status = "✅ متوفر" if product.stock > 0 else "❌ نفد المخزون"
+    return (
+        f"{product.name}\n"
+        f"الكود: {product.id}\n"
+        f"السعر: {product.price}\n"
+        f"المقاسات: {sizes_str}\n"
+        f"الحالة: {status}\n\n"
+        f"{product.description}"
     )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled exception", exc_info=context.error)
+ 
+ 
+async def _alert_owner(context: ContextTypes.DEFAULT_TYPE, update: Update,
+                       product: Optional[Product], reason: str):
+    user = update.effective_user
+    text = update.message.text or ""
+    product_line = f"\nالمنتج المرجّح: {product.name} ({product.id})" if product else ""
+    alert = (
+        f"🔔 رسالة تحتاج ردك ({reason})\n"
+        f"من: {user.full_name} (@{user.username or '—'}) | ID: {user.id}"
+        f"{product_line}\n\n"
+        f"{text}"
+    )
     try:
-        if update and getattr(update, "effective_chat", None):
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ Temporary error. Please try again.",
-                reply_markup=main_menu_for(update.effective_chat.id),
-            )
-    except Exception:
-        pass
-
-
-async def check_new(context: ContextTypes.DEFAULT_TYPE):
-    db.last_check_time = _now()
-    db.save()
-    log.info("check_new: initialized with 30 tokens.")
-
-
-async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
-    db.manipulation_last_check_time = _now()
-    tracked_total = len(db.tracked_tokens)
-    log.info("check_tracked_tokens STARTED")
-    if tracked_total == 0:
-        log.info("check_tracked_tokens: no tracked tokens.")
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=alert)
+    except Exception as e:
+        logger.error(f"فشل إرسال التنبيه: {e}")
+ 
+ 
+async def handle_customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == OWNER_CHAT_ID:
         return
-    log.info(f"check_tracked_tokens: tracking {tracked_total} token entries.")
-
-
-async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
-    db.smart_money_last_check_time = _now()
-    log.info("check_smart_money: heartbeat.")
-
-
-def build_application():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing from environment variables")
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("analyze", analyze_command))
-    app.add_handler(CommandHandler("mytokens", mytokens_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("subscribe", subscribe_command))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-    app.add_handler(CommandHandler("contact", contact_command))
-    app.add_handler(CommandHandler("reply", reply_command))
-    app.add_handler(CommandHandler("myid", myid_command))
-    app.add_handler(CommandHandler("activatepaid", activatepaid_command))
-    app.add_handler(CommandHandler("upgrade", upgrade_command))
-    app.add_handler(CommandHandler("analytics", analytics_command))
-    app.add_handler(CommandHandler("aiinsight", aiinsight_command))
-
-    # Core handlers
-    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.add_error_handler(error_handler)
-
-    # Jobs
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(check_new, interval=CHECK_INTERVAL, first=10)
-        app.job_queue.run_repeating(check_tracked_tokens, interval=300, first=30)
-        app.job_queue.run_repeating(check_smart_money, interval=SMART_MONEY_CHECK_INTERVAL, first=60)
-        log.info("Job queue started.")
-
-    return app
-
-
+ 
+    text = update.message.text or ""
+    product, _match_type = find_product(text, repo.get_all())
+ 
+    # المنطق المصحّح:
+    #   ينبّه صاحب المحل فقط إذا (لم يُعرف المنتج) أو (وُجدت نية شراء صريحة).
+    #   خلاف ذلك يرد بالسعر تلقائياً مهما كانت كلمات السؤال (عندكم؟ كيف؟ ...).
+    if product is None:
+        await _alert_owner(context, update, None, "لم يُعرف المنتج")
+        return
+ 
+    if has_purchase_intent(text):
+        await _alert_owner(context, update, product, "نية شراء")
+        return
+ 
+    await update.message.reply_text(_format_product_reply(product))
+ 
+ 
+# ============================================================
+#  5) التشغيل
+# ============================================================
 def main():
-    db.load()
-    log.info("=== ENTRYPOINT V22-GROQ-OPENROUTER ===")
-    app = build_application()
-    log.info("Quantara free-data-layer bot booting with Groq primary + OpenRouter fallback AI insight...")
-    app.run_polling(drop_pending_updates=True)
-
-
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN غير مضبوط")
+    if OWNER_CHAT_ID == 0:
+        logger.warning("OWNER_CHAT_ID غير مضبوط — أوامر صاحب المحل والتنبيهات لن تعمل.")
+ 
+    app = ApplicationBuilder().token(token).build()
+ 
+    add_conv = ConversationHandler(
+        entry_points=[CommandHandler("add", cmd_add_start)],
+        states={
+            ADD_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_id)],
+            ADD_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_name)],
+            ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_price)],
+            ADD_SIZES: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_sizes)],
+            ADD_STOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_stock)],
+            ADD_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_desc)],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+    )
+ 
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(add_conv)
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
+ 
+    logger.info("البوت يعمل...")
+    app.run_polling()
+ 
+ 
 if __name__ == "__main__":
     main()
