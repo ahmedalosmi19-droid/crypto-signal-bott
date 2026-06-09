@@ -1,325 +1,236 @@
-"""
-بوت تيليجرام لإدارة متجر إلكتروني (نواة المرحلة الأولى — محل واحد).
-ملف واحد كامل: النموذج + التخزين + المطابقة + المعالجات + التشغيل.
- 
-الإعداد قبل التشغيل:
-    1) احصل على التوكن من @BotFather عبر الأمر /newbot
-    2) احصل على معرّفك الرقمي من @userinfobot
-    3) اضبط متغيّري البيئة:
-         Windows (PowerShell):
-           $env:TELEGRAM_BOT_TOKEN = "توكنك_هنا"
-           $env:OWNER_CHAT_ID      = "معرفك_هنا"
-         Linux/Mac:
-           export TELEGRAM_BOT_TOKEN="توكنك_هنا"
-           export OWNER_CHAT_ID="معرفك_هنا"
-    4) ثبّت المكتبة:  pip install python-telegram-bot==21.6
-    5) شغّل:          python bot.py
- 
-ملاحظة: يُنشأ ملف products.json تلقائياً في أول تشغيل.
-"""
- 
 import os
-import re
 import json
-import logging
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
- 
-from telegram import Update
+import random
+import string
+
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
 )
- 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+
+# ── إعدادات البيئة ──────────────────────────────────────────
+TOKEN = os.environ["BOT_TOKEN"]
+OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
+DATA_FILE = "products.json"
+
+# ── حالات المحادثة ───────────────────────────────────────────
+ASK_NAME, ASK_PRICE, ASK_SIZES, CONFIRM_ADD, ASK_DEL_CODE = range(5)
+
+# ── لوحة مفاتيح المالك ──────────────────────────────────────
+OWNER_KB = ReplyKeyboardMarkup(
+    [["➕ إضافة سلعة"], ["📋 عرض السلع", "🗑 حذف سلعة"]],
+    resize_keyboard=True,
 )
-logger = logging.getLogger(__name__)
- 
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
-PRODUCTS_FILE = "products.json"
- 
- 
-# ============================================================
-#  1) نموذج البيانات
-# ============================================================
-@dataclass
-class Product:
-    id: str
-    name: str
-    price: float
-    sizes: List[str]
-    stock: int
-    description: str
- 
- 
-# ============================================================
-#  2) طبقة التخزين (معزولة — يسهل استبدالها بقاعدة بيانات لاحقاً)
-# ============================================================
-class ProductRepository:
-    def __init__(self, filepath: str = PRODUCTS_FILE):
-        self.filepath = filepath
-        if not os.path.exists(self.filepath):
-            self._save([])
- 
-    def _load(self) -> list:
-        with open(self.filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
- 
-    def _save(self, data: list):
-        with open(self.filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
- 
-    def get_all(self) -> List[Product]:
-        return [Product(**item) for item in self._load()]
- 
-    def add(self, product: Product) -> bool:
-        data = self._load()
-        if any(item["id"].lower() == product.id.lower() for item in data):
-            return False
-        data.append(asdict(product))
-        self._save(data)
-        return True
- 
-    def delete(self, product_id: str) -> bool:
-        data = self._load()
-        new_data = [i for i in data if i["id"].lower() != product_id.lower()]
-        if len(new_data) == len(data):
-            return False
-        self._save(new_data)
-        return True
- 
- 
-repo = ProductRepository()
- 
- 
-# ============================================================
-#  3) منطق المطابقة والفهم
-# ============================================================
-CODE_PATTERN = re.compile(r"\b[A-Za-z]{1,5}-\d{2,4}\b")
- 
-# نية شراء صريحة فقط — لا كلمات استفهام عامة (كيف/متى/عندكم...)
-PURCHASE_KEYWORDS = [
-    "اشتري", "أشتري", "اشتريه", "اطلب", "أطلب", "اطلبه", "اطلبية",
-    "اوردر", "أوردر", "احجز", "أحجز", "احجزه", "order", "buy", "purchase",
-]
- 
- 
-def find_product(text: str, products: List[Product]) -> Tuple[Optional[Product], Optional[str]]:
-    """
-    يعيد (المنتج، نوع التطابق):
-      "code" = طابق كوداً صريحاً مثل SH-001 (الأدق)
-      "text" = طابق باسم المنتج
-      (None, None) = لا تطابق
-    """
-    # 1) مطابقة الكود الصريح أولاً
-    for match in CODE_PATTERN.findall(text):
-        for p in products:
-            if p.id.lower() == match.lower():
-                return p, "code"
- 
-    # 2) مطابقة نصية بالاسم
-    text_lower = text.lower()
-    best, best_score = None, 0
-    for p in products:
-        score = sum(1 for word in p.name.lower().split() if word in text_lower)
-        if score > best_score:
-            best_score, best = score, p
- 
-    if best_score >= 1:
-        return best, "text"
-    return None, None
- 
- 
-def has_purchase_intent(text: str) -> bool:
-    """نية شراء صريحة فقط؛ أسئلة الأسعار العادية ليست نية شراء."""
-    t = text.lower()
-    return any(kw in t for kw in PURCHASE_KEYWORDS)
- 
- 
-# ============================================================
-#  4) المعالجات (Handlers)
-# ============================================================
-ADD_ID, ADD_NAME, ADD_PRICE, ADD_SIZES, ADD_STOCK, ADD_DESC = range(6)
- 
- 
-def _is_owner(update: Update) -> bool:
-    return update.effective_user.id == OWNER_CHAT_ID
- 
- 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أهلاً! أرسل اسم منتج أو كوده وسأردّ عليك فوراً.")
- 
- 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
+
+
+# ── قراءة وكتابة البيانات ─────────────────────────────────────
+def load_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {"products": {}, "retired_codes": []}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_data(data: dict) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ── توليد كود فريد (حرفان + شرطة + 4 رموز)، لا يتكرر أبداً ──
+def generate_code(data: dict) -> str:
+    blocked = set(data["products"].keys()) | set(data.get("retired_codes", []))
+    while True:
+        prefix = "".join(random.choices(string.ascii_uppercase, k=2))
+        suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        code = f"{prefix}-{suffix}"
+        if code not in blocked:
+            return code
+
+
+# ── مساعد: هل المرسل هو المالك؟ ────────────────────────────
+def is_owner(update: Update) -> bool:
+    return update.effective_chat.id == OWNER_CHAT_ID
+
+
+# ────────────────────────────────────────────────────────────
+# /start
+# ────────────────────────────────────────────────────────────
+async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    if is_owner(update):
+        await update.message.reply_text("مرحباً يا صاحب المحل 👋", reply_markup=OWNER_KB)
+    else:
+        await update.message.reply_text("البوت شغال.")
+
+
+# ────────────────────────────────────────────────────────────
+# عرض السلع (زر + أمر /list)
+# ────────────────────────────────────────────────────────────
+async def list_products(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
         return
-    products = repo.get_all()
-    if not products:
-        await update.message.reply_text("لا توجد منتجات.")
+    data = load_data()
+    if not data["products"]:
+        await update.message.reply_text("لا توجد سلع مسجّلة بعد.", reply_markup=OWNER_KB)
         return
     lines = []
-    for p in products:
-        status = "✅" if p.stock > 0 else "❌"
-        lines.append(f"{status} {p.id} — {p.name} | {p.price} | مخزون: {p.stock}")
-    await update.message.reply_text("\n".join(lines))
- 
- 
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
-        return
-    if not context.args:
-        await update.message.reply_text("الاستخدام: /delete SH-001")
-        return
-    code = context.args[0]
-    if repo.delete(code):
-        await update.message.reply_text(f"✅ تم حذف {code}")
-    else:
-        await update.message.reply_text(f"لم أجد منتجاً بالكود {code}")
- 
- 
-# --- حوار إضافة منتج (لصاحب المحل) ---
-async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
+    for code, p in data["products"].items():
+        sizes = ", ".join(p["sizes"]) if isinstance(p["sizes"], list) else p["sizes"]
+        lines.append(f"🏷 {code}\n📦 {p['name']}\n💰 {p['price']}\n📐 {sizes}")
+    await update.message.reply_text("\n\n".join(lines), reply_markup=OWNER_KB)
+
+
+# ────────────────────────────────────────────────────────────
+# إضافة سلعة — ConversationHandler
+# ────────────────────────────────────────────────────────────
+async def add_start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
         return ConversationHandler.END
-    await update.message.reply_text("أدخل كود المنتج (مثال: SH-001):")
-    return ADD_ID
- 
-async def add_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["np"] = {"id": update.message.text.strip()}
-    await update.message.reply_text("أدخل اسم المنتج:")
-    return ADD_NAME
- 
-async def add_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["np"]["name"] = update.message.text.strip()
-    await update.message.reply_text("أدخل السعر (رقم):")
-    return ADD_PRICE
- 
-async def add_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("اسم السلعة:", reply_markup=ReplyKeyboardRemove())
+    return ASK_NAME
+
+
+async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("السعر (رقم فقط):")
+    return ASK_PRICE
+
+
+async def got_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     try:
-        context.user_data["np"]["price"] = float(update.message.text.strip())
+        price = float(text)
     except ValueError:
-        await update.message.reply_text("أدخل رقماً صحيحاً:")
-        return ADD_PRICE
-    await update.message.reply_text("أدخل المقاسات مفصولة بفاصلة (مثال: S,M,L,XL):")
-    return ADD_SIZES
- 
-async def add_get_sizes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["np"]["sizes"] = [s.strip() for s in update.message.text.split(",") if s.strip()]
-    await update.message.reply_text("أدخل الكمية المتوفرة:")
-    return ADD_STOCK
- 
-async def add_get_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["np"]["stock"] = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("أدخل عدداً صحيحاً:")
-        return ADD_STOCK
-    await update.message.reply_text("أدخل وصف المنتج:")
-    return ADD_DESC
- 
-async def add_get_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["np"]["description"] = update.message.text.strip()
-    product = Product(**context.user_data.pop("np"))
-    if repo.add(product):
-        await update.message.reply_text(f"✅ تمت إضافة {product.name}")
-    else:
-        await update.message.reply_text(f"الكود {product.id} مستخدم مسبقاً.")
+        await update.message.reply_text("❌ السعر يجب أن يكون رقماً. أعد الإدخال:")
+        return ASK_PRICE
+    context.user_data["price"] = price
+    await update.message.reply_text("القياسات مفصولة بفاصلة (مثال: S,M,L,XL):")
+    return ASK_SIZES
+
+
+async def got_sizes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sizes = [s.strip() for s in update.message.text.split(",") if s.strip()]
+    context.user_data["sizes"] = sizes
+    name = context.user_data["name"]
+    price = context.user_data["price"]
+    summary = (
+        f"📋 ملخص السلعة:\n"
+        f"📦 الاسم: {name}\n"
+        f"💰 السعر: {price}\n"
+        f"📐 القياسات: {', '.join(sizes)}\n\n"
+        "تأكيد الحفظ؟"
+    )
+    confirm_kb = ReplyKeyboardMarkup([["✅ نعم", "❌ لا"]], resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(summary, reply_markup=confirm_kb)
+    return CONFIRM_ADD
+
+
+async def confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip()
+    if "نعم" not in answer:
+        await update.message.reply_text("❌ تم الإلغاء.", reply_markup=OWNER_KB)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    data = load_data()
+    code = generate_code(data)
+    data["products"][code] = {
+        "name": context.user_data["name"],
+        "price": context.user_data["price"],
+        "sizes": context.user_data["sizes"],
+    }
+    save_data(data)
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"تمت الإضافة ✅ — ضع هذا الكود في آخر كابشن منشور السلعة على إنستغرام: {code}",
+        reply_markup=OWNER_KB,
+    )
     return ConversationHandler.END
- 
-async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("np", None)
-    await update.message.reply_text("تم إلغاء الإضافة.")
+
+
+# ────────────────────────────────────────────────────────────
+# حذف سلعة — ConversationHandler
+# ────────────────────────────────────────────────────────────
+async def delete_start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return ConversationHandler.END
+    await update.message.reply_text("أرسل كود السلعة المراد حذفها:", reply_markup=ReplyKeyboardRemove())
+    return ASK_DEL_CODE
+
+
+async def delete_product(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip().upper()
+    data = load_data()
+
+    if code not in data["products"]:
+        await update.message.reply_text("❌ الكود غير موجود.", reply_markup=OWNER_KB)
+        return ConversationHandler.END
+
+    del data["products"][code]
+    # احتفظ بالكود في القائمة السوداء — لن يُعاد توليده أبداً
+    if "retired_codes" not in data:
+        data["retired_codes"] = []
+    data["retired_codes"].append(code)
+    save_data(data)
+
+    await update.message.reply_text(f"تم حذف السلعة {code} ✅", reply_markup=OWNER_KB)
     return ConversationHandler.END
- 
- 
-# --- رسائل الزبائن ---
-def _format_product_reply(product: Product) -> str:
-    sizes_str = "، ".join(product.sizes) if product.sizes else "—"
-    status = "✅ متوفر" if product.stock > 0 else "❌ نفد المخزون"
-    return (
-        f"{product.name}\n"
-        f"الكود: {product.id}\n"
-        f"السعر: {product.price}\n"
-        f"المقاسات: {sizes_str}\n"
-        f"الحالة: {status}\n\n"
-        f"{product.description}"
-    )
- 
- 
-async def _alert_owner(context: ContextTypes.DEFAULT_TYPE, update: Update,
-                       product: Optional[Product], reason: str):
-    user = update.effective_user
-    text = update.message.text or ""
-    product_line = f"\nالمنتج المرجّح: {product.name} ({product.id})" if product else ""
-    alert = (
-        f"🔔 رسالة تحتاج ردك ({reason})\n"
-        f"من: {user.full_name} (@{user.username or '—'}) | ID: {user.id}"
-        f"{product_line}\n\n"
-        f"{text}"
-    )
-    try:
-        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=alert)
-    except Exception as e:
-        logger.error(f"فشل إرسال التنبيه: {e}")
- 
- 
-async def handle_customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == OWNER_CHAT_ID:
-        return
- 
-    text = update.message.text or ""
-    product, _match_type = find_product(text, repo.get_all())
- 
-    # المنطق المصحّح:
-    #   ينبّه صاحب المحل فقط إذا (لم يُعرف المنتج) أو (وُجدت نية شراء صريحة).
-    #   خلاف ذلك يرد بالسعر تلقائياً مهما كانت كلمات السؤال (عندكم؟ كيف؟ ...).
-    if product is None:
-        await _alert_owner(context, update, None, "لم يُعرف المنتج")
-        return
- 
-    if has_purchase_intent(text):
-        await _alert_owner(context, update, product, "نية شراء")
-        return
- 
-    await update.message.reply_text(_format_product_reply(product))
- 
- 
-# ============================================================
-#  5) التشغيل
-# ============================================================
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN غير مضبوط")
-    if OWNER_CHAT_ID == 0:
-        logger.warning("OWNER_CHAT_ID غير مضبوط — أوامر صاحب المحل والتنبيهات لن تعمل.")
- 
-    app = ApplicationBuilder().token(token).build()
- 
-    add_conv = ConversationHandler(
-        entry_points=[CommandHandler("add", cmd_add_start)],
-        states={
-            ADD_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_id)],
-            ADD_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_name)],
-            ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_price)],
-            ADD_SIZES: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_sizes)],
-            ADD_STOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_stock)],
-            ADD_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_desc)],
-        },
-        fallbacks=[CommandHandler("cancel", add_cancel)],
-    )
- 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(add_conv)
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
- 
-    logger.info("البوت يعمل...")
-    app.run_polling()
- 
- 
-if __name__ == "__main__":
-    main()
+
+
+# ────────────────────────────────────────────────────────────
+# /cancel — يعمل داخل أي محادثة
+# ────────────────────────────────────────────────────────────
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("تم الإلغاء.", reply_markup=OWNER_KB)
+    return ConversationHandler.END
+
+
+# ────────────────────────────────────────────────────────────
+# منطق الزبون الحالي (لا يُمس)
+# ────────────────────────────────────────────────────────────
+async def echo(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    await update.message.reply_text(f"أنت كتبت: {user_text}")
+
+
+# ────────────────────────────────────────────────────────────
+# تجميع البوت
+# ────────────────────────────────────────────────────────────
+app = ApplicationBuilder().token(TOKEN).build()
+
+# محادثة الإضافة
+add_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex(r"^➕ إضافة سلعة$"), add_start)],
+    states={
+        ASK_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
+        ASK_PRICE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_price)],
+        ASK_SIZES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_sizes)],
+        CONFIRM_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_save)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+# محادثة الحذف
+del_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex(r"^🗑 حذف سلعة$"), delete_start)],
+    states={
+        ASK_DEL_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_product)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("list", list_products))
+app.add_handler(add_conv)
+app.add_handler(del_conv)
+app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"), list_products))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+print("Bot is running...")
+app.run_polling()
