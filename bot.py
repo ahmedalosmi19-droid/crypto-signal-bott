@@ -183,7 +183,6 @@ def migrate_from_json(json_path: str, owner_id: int) -> None:
             )
 
     os.rename(json_path, json_path + ".migrated")
-bot.py:
 
 
 import os
