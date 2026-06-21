@@ -80,19 +80,23 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO admin (telegram_id) VALUES (?)",
                 (int(admin_id),)
             )
+            # تحقق فوري من التسجيل
             registered = con.execute(
                 "SELECT telegram_id FROM admin WHERE telegram_id = ?", (int(admin_id),)
             ).fetchone()
             if registered:
-                logging.warning("[ADMIN] OK ADMIN_TELEGRAM_ID=%s مسجّل في جدول admin", admin_id)
+                logging.warning("[ADMIN] ✅ ADMIN_TELEGRAM_ID=%s مسجّل في جدول admin", admin_id)
             else:
-                logging.error("[ADMIN] FAIL ADMIN_TELEGRAM_ID=%s فشل التسجيل!", admin_id)
+                logging.error("[ADMIN] ❌ ADMIN_TELEGRAM_ID=%s فشل التسجيل!", admin_id)
         else:
-            logging.error("[ADMIN] ADMIN_TELEGRAM_ID غير مضبوط في متغيرات البيئة!")
+            logging.error("[ADMIN] ❌ ADMIN_TELEGRAM_ID غير مضبوط في متغيرات البيئة!")
 
 
-# ── الأدمن ──────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# الأدمن
+# ────────────────────────────────────────────────────────────
 def is_admin(telegram_id: int) -> bool:
+    """هل المعرّف في جدول الأدمن؟"""
     with _conn() as con:
         return con.execute(
             "SELECT 1 FROM admin WHERE telegram_id = ?", (telegram_id,)
@@ -100,13 +104,17 @@ def is_admin(telegram_id: int) -> bool:
 
 
 def get_admin_id() -> Optional[int]:
+    """جلب معرّف الأدمن الأول"""
     with _conn() as con:
         row = con.execute("SELECT telegram_id FROM admin LIMIT 1").fetchone()
         return row[0] if row else None
 
 
-# ── المحلات ─────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# المحلات
+# ────────────────────────────────────────────────────────────
 def add_shop(telegram_id: int, username: Optional[str] = None) -> None:
+    """أضف محلاً أو تجاهل إن كان موجوداً"""
     with _conn() as con:
         con.execute(
             "INSERT OR IGNORE INTO shops (telegram_id, username) VALUES (?, ?)",
@@ -115,6 +123,7 @@ def add_shop(telegram_id: int, username: Optional[str] = None) -> None:
 
 
 def get_shop(telegram_id: int) -> Optional[dict]:
+    """اجلب بيانات محل بمعرّفه"""
     with _conn() as con:
         row = con.execute(
             "SELECT * FROM shops WHERE telegram_id = ?", (telegram_id,)
@@ -125,6 +134,7 @@ def get_shop(telegram_id: int) -> Optional[dict]:
 def cleanup_admin_shop(admin_id: int) -> None:
     """احذف بيانات المحل القديمة للأدمن (تنظيف لمرة واحدة عند التحويل)"""
     with _conn() as con:
+        # انقل أكواد سلع الأدمن إلى المتقاعدة
         rows = con.execute(
             "SELECT code FROM products WHERE shop_id = ?", (admin_id,)
         ).fetchall()
@@ -145,6 +155,7 @@ def clear_test_shop(test_id: int) -> None:
 
 
 def set_shop_active_unlimited(telegram_id: int) -> None:
+    """فعّل محلاً بلا تاريخ انتهاء (احتياطي)"""
     with _conn() as con:
         con.execute(
             "UPDATE shops SET status='active', plan='admin', start_date=date('now') "
@@ -154,6 +165,7 @@ def set_shop_active_unlimited(telegram_id: int) -> None:
 
 
 def increment_message_count(shop_id: int) -> None:
+    """زد عدّاد رسائل الزبائن"""
     with _conn() as con:
         con.execute(
             "UPDATE shops SET message_count = message_count + 1 WHERE telegram_id = ?",
@@ -161,8 +173,11 @@ def increment_message_count(shop_id: int) -> None:
         )
 
 
-# ── أكواد التفعيل ───────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# أكواد التفعيل
+# ────────────────────────────────────────────────────────────
 def create_activation_code(shop_id: int, plan: str) -> str:
+    """ولّد كود تفعيل فريد (ACT-XXXXX) واحفظه"""
     with _conn() as con:
         while True:
             suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
@@ -201,8 +216,11 @@ def redeem_activation_code(code: str, shop_id: int) -> Optional[str]:
         return plan
 
 
-# ── السلع ───────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# السلع
+# ────────────────────────────────────────────────────────────
 def add_product(code: str, shop_id: int, name: str, price: float, sizes: list) -> None:
+    """أضف سلعة جديدة"""
     with _conn() as con:
         con.execute(
             "INSERT INTO products (code, shop_id, name, price, sizes) VALUES (?, ?, ?, ?, ?)",
@@ -211,6 +229,7 @@ def add_product(code: str, shop_id: int, name: str, price: float, sizes: list) -
 
 
 def get_product(code: str) -> Optional[dict]:
+    """اجلب سلعة بكودها"""
     with _conn() as con:
         row = con.execute(
             "SELECT * FROM products WHERE code = ?", (code,)
@@ -223,6 +242,7 @@ def get_product(code: str) -> Optional[dict]:
 
 
 def get_shop_products(shop_id: int) -> list:
+    """اجلب كل سلع محل معيّن"""
     with _conn() as con:
         rows = con.execute(
             "SELECT * FROM products WHERE shop_id = ?", (shop_id,)
@@ -236,6 +256,7 @@ def get_shop_products(shop_id: int) -> list:
 
 
 def delete_product(code: str, shop_id: int) -> bool:
+    """احذف السلعة إن كانت تخص هذا المحل، وانقل كودها للمتقاعدة"""
     with _conn() as con:
         affected = con.execute(
             "DELETE FROM products WHERE code = ? AND shop_id = ?", (code, shop_id)
@@ -247,7 +268,11 @@ def delete_product(code: str, shop_id: int) -> bool:
         return bool(affected)
 
 
+# ────────────────────────────────────────────────────────────
+# توليد كود السلعة
+# ────────────────────────────────────────────────────────────
 def generate_unique_code() -> str:
+    """ولّد كوداً فريداً عبر كل المنصّة (يتحقق من products و retired_codes)"""
     with _conn() as con:
         while True:
             prefix = "".join(random.choices(string.ascii_uppercase, k=2))
@@ -262,13 +287,83 @@ def generate_unique_code() -> str:
                 return code
 
 
-# ── ترحيل products.json ─────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# استعلامات لوحة الأدمن
+# ────────────────────────────────────────────────────────────
+def get_all_shops() -> list:
+    """كل المحلات مرتّبة: النشطة أولاً ثم المنتظرة ثم المنتهية، باستثناء الوهمية (ID سالب)"""
+    with _conn() as con:
+        rows = con.execute("""
+            SELECT telegram_id, username, status, plan,
+                   start_date, end_date, message_count, joined_at
+            FROM shops
+            WHERE telegram_id > 0
+            ORDER BY
+                CASE
+                    WHEN status = 'active'
+                         AND (end_date IS NULL OR end_date >= date('now')) THEN 0
+                    WHEN status = 'pending' THEN 1
+                    ELSE 2
+                END,
+                CASE WHEN end_date IS NULL THEN 1 ELSE 0 END,
+                end_date ASC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_platform_stats() -> dict:
+    """إحصاءات المنصّة: أعداد المحلات حسب الحالة وإجمالي السلع"""
+    with _conn() as con:
+        active = con.execute(
+            "SELECT COUNT(*) FROM shops WHERE telegram_id > 0 "
+            "AND status = 'active' AND (end_date IS NULL OR end_date >= date('now'))"
+        ).fetchone()[0]
+        expired = con.execute(
+            "SELECT COUNT(*) FROM shops WHERE telegram_id > 0 "
+            "AND status = 'active' AND end_date IS NOT NULL AND end_date < date('now')"
+        ).fetchone()[0]
+        pending = con.execute(
+            "SELECT COUNT(*) FROM shops WHERE telegram_id > 0 AND status = 'pending'"
+        ).fetchone()[0]
+        products = con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        return {
+            "active":   active,
+            "expired":  expired,
+            "pending":  pending,
+            "total":    active + expired + pending,
+            "products": products,
+        }
+
+
+def get_expiring_soon(days: int = 3) -> list:
+    """المحلات النشطة التي ينتهي اشتراكها خلال عدد الأيام المحدّد"""
+    with _conn() as con:
+        rows = con.execute("""
+            SELECT telegram_id, username, end_date
+            FROM shops
+            WHERE telegram_id > 0
+              AND status = 'active'
+              AND end_date IS NOT NULL
+              AND date(end_date) >= date('now')
+              AND date(end_date) <= date('now', ?)
+            ORDER BY end_date ASC
+        """, (f"+{days} days",)).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ────────────────────────────────────────────────────────────
+# ترحيل products.json
+# ────────────────────────────────────────────────────────────
 def migrate_from_json(json_path: str, owner_id: int) -> None:
+    """رحّل products.json إلى DB إن وُجد الملف، ثم أعد تسميته"""
     if not os.path.exists(json_path):
         return
+
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
     add_shop(owner_id)
+
     for code, p in data.get("products", {}).items():
         sizes = (
             p["sizes"] if isinstance(p["sizes"], list)
@@ -278,9 +373,11 @@ def migrate_from_json(json_path: str, owner_id: int) -> None:
             add_product(code, owner_id, p["name"], float(p["price"]), sizes)
         except Exception:
             pass
+
     with _conn() as con:
         for code in data.get("retired_codes", []):
             con.execute(
                 "INSERT OR IGNORE INTO retired_codes (code) VALUES (?)", (code,)
             )
+
     os.rename(json_path, json_path + ".migrated")
