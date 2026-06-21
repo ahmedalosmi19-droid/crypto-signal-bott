@@ -18,77 +18,121 @@ from telegram.ext import (
     filters,
 )
 
-# ── إعدادات البيئة ──────────────────────────────────────────
-TOKEN = os.environ["BOT_TOKEN"]
+TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+assert TOKEN, "يجب ضبط BOT_TOKEN أو TELEGRAM_BOT_TOKEN"
 OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
 
-# ── تهيئة قاعدة البيانات والترحيل ───────────────────────────
 db.init_db()
 db.migrate_from_json("products.json", OWNER_CHAT_ID)
-db.add_shop(OWNER_CHAT_ID)
-db.set_shop_active_unlimited(OWNER_CHAT_ID)  # الأدمن نشط دائماً للاختبار
+db.cleanup_admin_shop(OWNER_CHAT_ID)
 
-# ── حالات المحادثة ───────────────────────────────────────────
 ASK_NAME, ASK_PRICE, ASK_SIZES, CONFIRM_ADD, ASK_DEL_CODE = range(5)
 
-# ── لوحة مفاتيح المحل النشط ──────────────────────────────────
+PLAN_LABELS = {
+    "biweekly": "أسبوعان",
+    "monthly":  "شهر",
+    "yearly":   "سنة",
+}
+
+ADMIN_KB = ReplyKeyboardMarkup(
+    [["📊 المشتركون", "📈 إحصاءات المنصّة"]],
+    resize_keyboard=True,
+)
 OWNER_KB = ReplyKeyboardMarkup(
     [["➕ إضافة سلعة"], ["📋 عرض السلع", "🗑 حذف سلعة"]],
     resize_keyboard=True,
 )
 
 
-# ── مساعد: هل يمكن لهذا المستخدم إدارة سلعه؟ ────────────────
+def _eff_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("test_mode"):
+        return context.user_data["test_shop_id"]
+    return update.effective_chat.id
+
+
+def _clear_conv(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in ("name", "price", "sizes"):
+        context.user_data.pop(key, None)
+
+
 def can_manage(uid: int) -> bool:
-    """أدمن أو محل نشط"""
-    if db.is_admin(uid):
-        return True
     shop = db.get_shop(uid)
     return shop is not None and shop["status"] == "active"
 
 
-async def _deny_pending(update: Update) -> None:
-    """رد على المحل المعلّق بطلب التفعيل"""
-    shop = db.get_shop(update.effective_chat.id)
+async def _deny_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = _eff_uid(update, context)
+    shop = db.get_shop(uid)
     if shop and shop["status"] == "pending":
         await update.message.reply_text("أرسل كود التفعيل أولاً.")
     else:
         await update.message.reply_text("غير مصرّح.")
 
 
-# ────────────────────────────────────────────────────────────
-# /start
-# ────────────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    username = update.effective_user.username
+def _duration_kb(shop_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("أسبوعان", callback_data=f"dur_biweekly_{shop_id}"),
+        InlineKeyboardButton("شهر",    callback_data=f"dur_monthly_{shop_id}"),
+        InlineKeyboardButton("سنة",    callback_data=f"dur_yearly_{shop_id}"),
+    ]])
 
-    # أدمن
-    if db.is_admin(uid):
-        await update.message.reply_text("مرحباً يا أدمن 👑", reply_markup=OWNER_KB)
+
+async def testclient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    if not db.is_admin(uid):
+        return
+    test_id = -uid
+    db.clear_test_shop(test_id)
+    context.user_data["test_mode"]    = True
+    context.user_data["test_shop_id"] = test_id
+    await update.message.reply_text(
+        "دخلت وضع اختبار المحل. استعمل /exittest للخروج.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def exittest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    if not db.is_admin(uid):
+        return
+    context.user_data.pop("test_mode",    None)
+    context.user_data.pop("test_shop_id", None)
+    await update.message.reply_text("خرجت من وضع الاختبار.", reply_markup=ADMIN_KB)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    real_uid = update.effective_chat.id
+    username = update.effective_user.username
+    in_test  = context.user_data.get("test_mode", False)
+
+    if db.is_admin(real_uid) and not in_test:
+        await update.message.reply_text(
+            "مرحباً أيها الأدمن.\n"
+            "تصلك هنا إشعارات تسجيل المحلات.\n"
+            "استعمل /testclient لتجربة واجهة المحل.",
+            reply_markup=ADMIN_KB,
+        )
         return
 
+    uid  = _eff_uid(update, context)
     shop = db.get_shop(uid)
 
     if shop is None:
-        # مستخدم جديد — سجّله وأبلّغ الأدمن
-        db.add_shop(uid, username)
+        display_name = f"test_{username or real_uid}" if in_test else username
+        db.add_shop(uid, display_name)
         await update.message.reply_text(
             "أهلاً بك في المنصّة.\n"
             "لتفعيل حسابك أرسل كود التفعيل الذي ستحصل عليه من الإدارة."
         )
         admin_id = db.get_admin_id()
         if admin_id:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("تفعيل شهري",   callback_data=f"act_monthly_{uid}"),
-                InlineKeyboardButton("تفعيل أسبوعي", callback_data=f"act_weekly_{uid}"),
-            ]])
+            label = "[اختبار] " if in_test else ""
             await context.bot.send_message(
                 admin_id,
-                f"🏪 محل جديد سجّل\n"
+                f"🏪 {label}محل جديد سجّل\n"
                 f"المعرّف: {uid}\n"
                 f"اليوزر: @{username or 'بدون يوزر'}",
-                reply_markup=kb,
+                reply_markup=_duration_kb(uid),
             )
         return
 
@@ -101,40 +145,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ────────────────────────────────────────────────────────────
-# ضغط الأدمن على زر التفعيل → توليد الكود
-# ────────────────────────────────────────────────────────────
-async def handle_activation_button(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def handle_activation_cb(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     if not db.is_admin(query.from_user.id):
         return
 
-    # callback_data: act_monthly_123456  أو  act_weekly_123456
-    parts = query.data.split("_")          # ['act', 'monthly'/'weekly', '<id>']
-    plan = parts[1]
-    shop_id = int(parts[2])
+    data = query.data
 
-    code = db.create_activation_code(shop_id, plan)
-    plan_ar = "شهري" if plan == "monthly" else "أسبوعي"
+    if data.startswith("dur_"):
+        _, plan, shop_id_str = data.split("_", 2)
+        shop_id  = int(shop_id_str)
+        shop     = db.get_shop(shop_id)
+        username = (shop["username"] if shop else None) or "بدون يوزر"
+        plan_ar  = PLAN_LABELS.get(plan, plan)
+        await query.edit_message_text(
+            f"المحل: @{username} ({shop_id})\nالمدة: {plan_ar}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ توليد الكود", callback_data=f"gen_{plan}_{shop_id}"),
+                InlineKeyboardButton("↩️ رجوع",       callback_data=f"back_{shop_id}"),
+            ]]),
+        )
 
-    await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(
-        f"✅ كود التفعيل ({plan_ar}) للمحل {shop_id}:\n\n"
-        f"{code}\n\n"
-        f"أرسل هذا الكود لصاحب المحل."
-    )
+    elif data.startswith("gen_"):
+        _, plan, shop_id_str = data.split("_", 2)
+        shop_id  = int(shop_id_str)
+        shop     = db.get_shop(shop_id)
+        username = (shop["username"] if shop else None) or "بدون يوزر"
+        code     = db.create_activation_code(shop_id, plan)
+        await query.edit_message_text(
+            f"✅ كود التفعيل للمحل @{username} ({shop_id}):\n\n"
+            f"{code}\n\n"
+            f"أرسل هذا الكود لصاحب المحل.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 إعادة التوليد بمدة أخرى", callback_data=f"back_{shop_id}"),
+            ]]),
+        )
+
+    elif data.startswith("back_"):
+        shop_id  = int(data[5:])
+        shop     = db.get_shop(shop_id)
+        username = (shop["username"] if shop else None) or "بدون يوزر"
+        label    = "[اختبار] " if shop_id < 0 else ""
+        await query.edit_message_text(
+            f"🏪 {label}محل جديد سجّل\n"
+            f"المعرّف: {shop_id}\n"
+            f"اليوزر: @{username}",
+            reply_markup=_duration_kb(shop_id),
+        )
 
 
-# ────────────────────────────────────────────────────────────
-# إرسال المحل كود التفعيل
-# ────────────────────────────────────────────────────────────
-async def handle_activation_code(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
+async def handle_activation_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid  = _eff_uid(update, context)
     shop = db.get_shop(uid)
 
-    # إن لم يكن محلاً معلّقاً، تصرّف كـ echo عادي
     if shop is None or shop["status"] != "pending":
         await update.message.reply_text(f"أنت كتبت: {update.message.text}")
         return
@@ -146,21 +211,26 @@ async def handle_activation_code(update: Update, _context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ كود غير صالح.")
         return
 
-    shop = db.get_shop(uid)
-    plan_ar = "شهري" if plan == "monthly" else "أسبوعي"
+    shop    = db.get_shop(uid)
+    plan_ar = PLAN_LABELS.get(plan, plan)
     await update.message.reply_text(
         f"✅ تم تفعيل اشتراكك ({plan_ar} — ينتهي {shop['end_date']})",
         reply_markup=OWNER_KB,
     )
 
 
-# ────────────────────────────────────────────────────────────
-# عرض السلع (زر + أمر /list)
-# ────────────────────────────────────────────────────────────
-async def list_products(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def admin_stub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
+    if not db.is_admin(uid) or context.user_data.get("test_mode"):
+        await update.message.reply_text(f"أنت كتبت: {update.message.text}")
+        return
+    await update.message.reply_text("هذه الميزة قيد البناء.", reply_markup=ADMIN_KB)
+
+
+async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _eff_uid(update, context)
     if not can_manage(uid):
-        await _deny_pending(update)
+        await _deny_pending(update, context)
         return
     products = db.get_shop_products(uid)
     if not products:
@@ -173,13 +243,10 @@ async def list_products(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n\n".join(lines), reply_markup=OWNER_KB)
 
 
-# ────────────────────────────────────────────────────────────
-# إضافة سلعة — ConversationHandler
-# ────────────────────────────────────────────────────────────
-async def add_start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _eff_uid(update, context)
     if not can_manage(uid):
-        await _deny_pending(update)
+        await _deny_pending(update, context)
         return ConversationHandler.END
     await update.message.reply_text("اسم السلعة:", reply_markup=ReplyKeyboardRemove())
     return ASK_NAME
@@ -225,10 +292,10 @@ async def got_sizes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "نعم" not in update.message.text.strip():
         await update.message.reply_text("❌ تم الإلغاء.", reply_markup=OWNER_KB)
-        context.user_data.clear()
+        _clear_conv(context)
         return ConversationHandler.END
 
-    uid  = update.effective_chat.id
+    uid  = _eff_uid(update, context)
     code = db.generate_unique_code()
     db.add_product(
         code, uid,
@@ -236,8 +303,7 @@ async def confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["price"],
         context.user_data["sizes"],
     )
-    context.user_data.clear()
-
+    _clear_conv(context)
     await update.message.reply_text(
         f"تمت الإضافة ✅ — ضع هذا الكود في آخر كابشن منشور السلعة على إنستغرام: {code}",
         reply_markup=OWNER_KB,
@@ -245,20 +311,17 @@ async def confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ────────────────────────────────────────────────────────────
-# حذف سلعة — ConversationHandler
-# ────────────────────────────────────────────────────────────
-async def delete_start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
+async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _eff_uid(update, context)
     if not can_manage(uid):
-        await _deny_pending(update)
+        await _deny_pending(update, context)
         return ConversationHandler.END
     await update.message.reply_text("أرسل كود السلعة المراد حذفها:", reply_markup=ReplyKeyboardRemove())
     return ASK_DEL_CODE
 
 
-async def handle_delete(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    uid     = update.effective_chat.id
+async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid     = _eff_uid(update, context)
     code    = update.message.text.strip().upper()
     deleted = db.delete_product(code, uid)
     if not deleted:
@@ -268,25 +331,16 @@ async def handle_delete(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ────────────────────────────────────────────────────────────
-# /cancel
-# ────────────────────────────────────────────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    _clear_conv(context)
     await update.message.reply_text("تم الإلغاء.", reply_markup=OWNER_KB)
     return ConversationHandler.END
 
 
-# ────────────────────────────────────────────────────────────
-# منطق الزبون الحالي (لا يُمس)
-# ────────────────────────────────────────────────────────────
 async def echo(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"أنت كتبت: {update.message.text}")
 
 
-# ────────────────────────────────────────────────────────────
-# تجميع البوت
-# ────────────────────────────────────────────────────────────
 app = ApplicationBuilder().token(TOKEN).build()
 
 add_conv = ConversationHandler(
@@ -308,15 +362,17 @@ del_conv = ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel)],
 )
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("list", list_products))
-app.add_handler(CallbackQueryHandler(handle_activation_button, pattern=r"^act_(monthly|weekly)_\d+$"))
+app.add_handler(CommandHandler("start",      start))
+app.add_handler(CommandHandler("list",       list_products))
+app.add_handler(CommandHandler("testclient", testclient))
+app.add_handler(CommandHandler("exittest",   exittest))
+app.add_handler(CallbackQueryHandler(handle_activation_cb, pattern=r"^(dur|gen|back)_"))
 app.add_handler(add_conv)
 app.add_handler(del_conv)
-app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"), list_products))
-# كود التفعيل يُعالَج قبل echo
-app.add_handler(MessageHandler(filters.Regex(r"^ACT-[A-Z0-9]{5}$"), handle_activation_code))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"),                       list_products))
+app.add_handler(MessageHandler(filters.Regex(r"^📊 المشتركون$|^📈 إحصاءات المنصّة$"), admin_stub))
+app.add_handler(MessageHandler(filters.Regex(r"^ACT-[A-Z0-9]{5}$"),                   handle_activation_code))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,                        echo))
 
 print("Bot is running...")
 app.run_polling()
