@@ -16,6 +16,7 @@ PLAN_DAYS = {
     "yearly":   365,
 }
 
+
 @contextmanager
 def _conn():
     """مدير سياق للاتصال بقاعدة البيانات"""
@@ -29,6 +30,7 @@ def _conn():
         raise
     finally:
         con.close()
+
 
 # ────────────────────────────────────────────────────────────
 # تهيئة الجداول
@@ -89,6 +91,7 @@ def init_db() -> None:
         else:
             logging.error("[ADMIN] ❌ ADMIN_TELEGRAM_ID غير مضبوط في متغيرات البيئة!")
 
+
 # ────────────────────────────────────────────────────────────
 # الأدمن
 # ────────────────────────────────────────────────────────────
@@ -99,11 +102,13 @@ def is_admin(telegram_id: int) -> bool:
             "SELECT 1 FROM admin WHERE telegram_id = ?", (telegram_id,)
         ).fetchone() is not None
 
+
 def get_admin_id() -> Optional[int]:
     """جلب معرّف الأدمن الأول"""
     with _conn() as con:
         row = con.execute("SELECT telegram_id FROM admin LIMIT 1").fetchone()
         return row[0] if row else None
+
 
 # ────────────────────────────────────────────────────────────
 # المحلات
@@ -116,6 +121,7 @@ def add_shop(telegram_id: int, username: Optional[str] = None) -> None:
             (telegram_id, username)
         )
 
+
 def get_shop(telegram_id: int) -> Optional[dict]:
     """اجلب بيانات محل بمعرّفه"""
     with _conn() as con:
@@ -123,6 +129,7 @@ def get_shop(telegram_id: int) -> Optional[dict]:
             "SELECT * FROM shops WHERE telegram_id = ?", (telegram_id,)
         ).fetchone()
         return dict(row) if row else None
+
 
 def cleanup_admin_shop(admin_id: int) -> None:
     """احذف بيانات المحل القديمة للأدمن (تنظيف لمرة واحدة عند التحويل)"""
@@ -138,12 +145,14 @@ def cleanup_admin_shop(admin_id: int) -> None:
         con.execute("DELETE FROM products WHERE shop_id = ?", (admin_id,))
         con.execute("DELETE FROM shops WHERE telegram_id = ?", (admin_id,))
 
+
 def clear_test_shop(test_id: int) -> None:
     """امسح بيانات محل الاختبار لبدء نظيف في كل جلسة"""
     with _conn() as con:
         con.execute("DELETE FROM products WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM activation_codes WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM shops WHERE telegram_id = ?", (test_id,))
+
 
 def set_shop_active_unlimited(telegram_id: int) -> None:
     """فعّل محلاً بلا تاريخ انتهاء (احتياطي)"""
@@ -154,6 +163,7 @@ def set_shop_active_unlimited(telegram_id: int) -> None:
             (telegram_id,)
         )
 
+
 def increment_message_count(shop_id: int) -> None:
     """زد عدّاد رسائل الزبائن"""
     with _conn() as con:
@@ -162,12 +172,18 @@ def increment_message_count(shop_id: int) -> None:
             (shop_id,)
         )
 
+
 # ────────────────────────────────────────────────────────────
 # أكواد التفعيل
 # ────────────────────────────────────────────────────────────
 def create_activation_code(shop_id: int, plan: str) -> str:
-    """ولّد كود تفعيل فريد (ACT-XXXXX) واحفظه"""
+    """ولّد كود تفعيل فريد (ACT-XXXXX) — يُبطل أي كود قديم غير مستخدم لنفس المحل أولاً"""
     with _conn() as con:
+        # كود واحد صالح فقط لكل محل في أي وقت
+        con.execute(
+            "DELETE FROM activation_codes WHERE shop_id = ? AND used = 0",
+            (shop_id,)
+        )
         while True:
             suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
             code = f"ACT-{suffix}"
@@ -180,6 +196,7 @@ def create_activation_code(shop_id: int, plan: str) -> str:
                     (code, shop_id, plan)
                 )
                 return code
+
 
 def redeem_activation_code(code: str, shop_id: int) -> Optional[str]:
     """تحقق من كود التفعيل وفعّل المحل. يُعيد اسم الخطة أو None إن فشل."""
@@ -203,6 +220,7 @@ def redeem_activation_code(code: str, shop_id: int) -> Optional[str]:
         con.execute("UPDATE activation_codes SET used=1 WHERE code=?", (code,))
         return plan
 
+
 # ────────────────────────────────────────────────────────────
 # السلع
 # ────────────────────────────────────────────────────────────
@@ -213,6 +231,7 @@ def add_product(code: str, shop_id: int, name: str, price: float, sizes: list) -
             "INSERT INTO products (code, shop_id, name, price, sizes) VALUES (?, ?, ?, ?, ?)",
             (code, shop_id, name, price, ",".join(sizes))
         )
+
 
 def get_product(code: str) -> Optional[dict]:
     """اجلب سلعة بكودها"""
@@ -225,6 +244,7 @@ def get_product(code: str) -> Optional[dict]:
         p = dict(row)
         p["sizes"] = p["sizes"].split(",")
         return p
+
 
 def get_shop_products(shop_id: int) -> list:
     """اجلب كل سلع محل معيّن"""
@@ -239,6 +259,7 @@ def get_shop_products(shop_id: int) -> list:
             result.append(p)
         return result
 
+
 def delete_product(code: str, shop_id: int) -> bool:
     """احذف السلعة إن كانت تخص هذا المحل، وانقل كودها للمتقاعدة"""
     with _conn() as con:
@@ -250,6 +271,7 @@ def delete_product(code: str, shop_id: int) -> bool:
                 "INSERT OR IGNORE INTO retired_codes (code) VALUES (?)", (code,)
             )
         return bool(affected)
+
 
 # ────────────────────────────────────────────────────────────
 # توليد كود السلعة
@@ -268,6 +290,7 @@ def generate_unique_code() -> str:
             ).fetchone()
             if not exists:
                 return code
+
 
 # ────────────────────────────────────────────────────────────
 # استعلامات لوحة الأدمن
@@ -291,6 +314,7 @@ def get_all_shops() -> list:
                 end_date ASC
         """).fetchall()
         return [dict(r) for r in rows]
+
 
 def get_platform_stats() -> dict:
     """إحصاءات المنصّة: أعداد المحلات حسب الحالة وإجمالي السلع"""
@@ -316,6 +340,7 @@ def get_platform_stats() -> dict:
             "products": products,
         }
 
+
 def get_expiring_soon(days: int = 3) -> list:
     """المحلات النشطة التي ينتهي اشتراكها خلال عدد الأيام المحدّد"""
     with _conn() as con:
@@ -331,6 +356,7 @@ def get_expiring_soon(days: int = 3) -> list:
         """, (f"+{days} days",)).fetchall()
         return [dict(r) for r in rows]
 
+
 def is_subscription_active(shop_id: int) -> bool:
     """هل اشتراك المحل ساري؟ (نشط وتاريخ انتهائه اليوم أو مستقبلاً أو بلا تاريخ)"""
     with _conn() as con:
@@ -340,6 +366,7 @@ def is_subscription_active(shop_id: int) -> bool:
             (shop_id,)
         ).fetchone()
         return row is not None
+
 
 def expire_overdue_shops() -> list:
     """حدّث المحلات المنتهية إلى expired وأعد قائمة معرّفاتها (يُستثنى الوهمي)"""
@@ -357,6 +384,7 @@ def expire_overdue_shops() -> list:
                 ids
             )
         return ids
+
 
 # ────────────────────────────────────────────────────────────
 # ترحيل products.json
