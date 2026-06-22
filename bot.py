@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import date as _date
+from datetime import date as _date, time as _time
 
 import database as db
 from telegram import (
@@ -77,16 +77,22 @@ def _clear_conv(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def can_manage(uid: int) -> bool:
-    """محل نشط فقط — الأدمن خارج وضع الاختبار لا يملك محلاً"""
+    """محل نشط وساري الاشتراك فقط"""
     shop = db.get_shop(uid)
-    return shop is not None and shop["status"] == "active"
+    if shop is None:
+        return False
+    return db.is_subscription_active(uid)
 
 
 async def _deny_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid  = _eff_uid(update, context)
     shop = db.get_shop(uid)
-    if shop and shop["status"] == "pending":
+    if shop is None:
+        await update.message.reply_text("غير مصرّح.")
+    elif shop["status"] == "pending":
         await update.message.reply_text("أرسل كود التفعيل أولاً.")
+    elif not db.is_subscription_active(uid):
+        await update.message.reply_text("انتهى اشتراكك ⏳ — تواصل مع الإدارة للتجديد.")
     else:
         await update.message.reply_text("غير مصرّح.")
 
@@ -260,8 +266,8 @@ async def handle_activation_code(update: Update, context: ContextTypes.DEFAULT_T
     uid  = _eff_uid(update, context)
     shop = db.get_shop(uid)
 
-    # ليس محلاً معلّقاً — تصرّف كـ echo عادي
-    if shop is None or shop["status"] != "pending":
+    # فقط المعلّق أو المنتهي يُدخل كود تفعيل — غيرهما echo
+    if shop is None or shop["status"] not in ("pending", "expired"):
         await update.message.reply_text(f"أنت كتبت: {update.message.text}")
         return
 
@@ -299,7 +305,7 @@ async def show_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for s in shops:
         end = s["end_date"] or ""
-        if s["status"] == "active" and end and end < today:
+        if s["status"] == "expired" or (s["status"] == "active" and end and end < today):
             badge = "❌ منتهٍ"
         elif s["status"] == "active":
             badge = "✅ نشط"
@@ -477,9 +483,74 @@ async def echo(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
 
 # ────────────────────────────────────────────────────────────
+# المهام الدورية (JobQueue)
+# ────────────────────────────────────────────────────────────
+async def job_expire_shops(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أقفل المحلات المنتهية يومياً وأشعر أصحابها والأدمن"""
+    expired_ids = db.expire_overdue_shops()
+    if not expired_ids:
+        return
+
+    for shop_id in expired_ids:
+        try:
+            await context.bot.send_message(
+                shop_id,
+                "انتهى اشتراكك ⏳ — تواصل مع الإدارة للتجديد."
+            )
+        except Exception:
+            pass  # المحل قد يكون حجب البوت
+
+    admin_id = db.get_admin_id()
+    if not admin_id:
+        return
+    lines = []
+    for shop_id in expired_ids:
+        shop = db.get_shop(shop_id)
+        uname = (shop["username"] if shop else None) or "بدون يوزر"
+        lines.append(f"@{uname} ({shop_id})")
+    await context.bot.send_message(
+        admin_id,
+        f"🔴 أُقفل {len(expired_ids)} محل اليوم:\n" + "\n".join(lines)
+    )
+
+
+async def job_expiring_soon(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """نبّه الأدمن بالمحلات التي تنتهي خلال 3 أيام — مرة واحدة يومياً"""
+    today = _date.today().isoformat()
+    if context.bot_data.get("expiring_notified") == today:
+        return
+
+    admin_id = db.get_admin_id()
+    if not admin_id:
+        return
+
+    shops = db.get_expiring_soon(3)
+    if not shops:
+        context.bot_data["expiring_notified"] = today
+        return
+
+    lines = [
+        f"@{s['username'] or 'بدون يوزر'} ({s['telegram_id']}) — ينتهي {s['end_date']}"
+        for s in shops
+    ]
+    await context.bot.send_message(
+        admin_id,
+        f"⚠️ {len(shops)} محل ينتهي اشتراكه خلال 3 أيام:\n\n" + "\n".join(lines)
+    )
+    context.bot_data["expiring_notified"] = today
+
+
+async def _post_init(application) -> None:
+    """جدوِل المهام الدورية بعد تهيئة التطبيق"""
+    jq = application.job_queue
+    jq.run_daily(job_expire_shops,  _time(0, 5))   # 00:05 UTC
+    jq.run_daily(job_expiring_soon, _time(0, 10))  # 00:10 UTC
+
+
+# ────────────────────────────────────────────────────────────
 # تجميع البوت
 # ────────────────────────────────────────────────────────────
-app = ApplicationBuilder().token(TOKEN).build()
+app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
 
 add_conv = ConversationHandler(
     entry_points=[MessageHandler(filters.Regex(r"^➕ إضافة سلعة$"), add_start)],
