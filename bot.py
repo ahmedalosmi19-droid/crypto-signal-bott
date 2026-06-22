@@ -106,6 +106,34 @@ def _duration_kb(shop_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+async def _register_new_shop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    display_name,
+    is_test: bool,
+) -> None:
+    """سجّل محلاً جديداً (pending) وأرسل رسالة الترحيب وإشعار الأدمن"""
+    db.add_shop(uid, display_name)
+    # في وضع الاختبار نُزيل كيبورد الأدمن لمحاكاة تجربة المحل
+    kb = ReplyKeyboardRemove() if is_test else None
+    await update.message.reply_text(
+        "أهلاً بك في المنصّة.\n"
+        "لتفعيل حسابك أرسل كود التفعيل الذي ستحصل عليه من الإدارة.",
+        reply_markup=kb,
+    )
+    admin_id = db.get_admin_id()
+    if admin_id:
+        label = "[اختبار] " if is_test else ""
+        await context.bot.send_message(
+            admin_id,
+            f"🏪 {label}محل جديد سجّل\n"
+            f"المعرّف: {uid}\n"
+            f"اليوزر: @{display_name or 'بدون يوزر'}",
+            reply_markup=_duration_kb(uid),
+        )
+
+
 # ────────────────────────────────────────────────────────────
 # /whoami — تشخيص هوية المُرسِل
 # ────────────────────────────────────────────────────────────
@@ -124,18 +152,19 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # وضع اختبار المحل
 # ────────────────────────────────────────────────────────────
 async def testclient(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/testclient — يدخل الأدمن في وضع محاكاة محل جديد"""
+    """/testclient — يدخل الأدمن وضع المحاكاة ويُسجّل المحل الوهمي فوراً"""
     uid = update.effective_chat.id
     if not db.is_admin(uid):
         return
-    test_id = -uid  # معرّف سالب لا يتعارض مع أي حساب حقيقي
-    db.clear_test_shop(test_id)  # بدء نظيف في كل جلسة
+    test_id  = -uid
+    username = update.effective_user.username
+    # فعّل وضع الاختبار أولاً حتى تعمل _eff_uid بشكل صحيح
     context.user_data["test_mode"]    = True
     context.user_data["test_shop_id"] = test_id
-    await update.message.reply_text(
-        "دخلت وضع اختبار المحل. استعمل /exittest للخروج.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    # امسح بيانات الجلسة السابقة (يحدث هنا فقط، لا عند /exittest)
+    db.clear_test_shop(test_id)
+    display_name = f"test_{username or uid}"
+    await _register_new_shop(update, context, test_id, display_name, is_test=True)
 
 
 async def exittest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -170,23 +199,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shop = db.get_shop(uid)
 
     if shop is None:
-        # محل جديد — سجّله وأرسل إشعاراً للأدمن
         display_name = f"test_{username or real_uid}" if in_test else username
-        db.add_shop(uid, display_name)
-        await update.message.reply_text(
-            "أهلاً بك في المنصّة.\n"
-            "لتفعيل حسابك أرسل كود التفعيل الذي ستحصل عليه من الإدارة."
-        )
-        admin_id = db.get_admin_id()
-        if admin_id:
-            label = "[اختبار] " if in_test else ""
-            await context.bot.send_message(
-                admin_id,
-                f"🏪 {label}محل جديد سجّل\n"
-                f"المعرّف: {uid}\n"
-                f"اليوزر: @{username or 'بدون يوزر'}",
-                reply_markup=_duration_kb(uid),
-            )
+        await _register_new_shop(update, context, uid, display_name, in_test)
         return
 
     if shop["status"] == "active":
@@ -205,6 +219,7 @@ async def handle_activation_cb(update: Update, _context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
+    # الـ callbacks الخاصة بالتفعيل للأدمن فقط
     if not db.is_admin(query.from_user.id):
         return
 
@@ -594,8 +609,8 @@ async def job_expiring_soon(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _post_init(application) -> None:
     """جدوِل المهام الدورية بعد تهيئة التطبيق"""
     jq = application.job_queue
-    jq.run_daily(job_expire_shops,  _time(0, 5))   # 00:05 UTC
-    jq.run_daily(job_expiring_soon, _time(0, 10))  # 00:10 UTC
+    jq.run_daily(job_expire_shops,   _time(0, 5))   # 00:05 UTC
+    jq.run_daily(job_expiring_soon,  _time(0, 10))  # 00:10 UTC
 
 
 # ────────────────────────────────────────────────────────────
@@ -642,4 +657,5 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,               ec
 
 print("Bot is running...")
 app.run_polling()
+
 
