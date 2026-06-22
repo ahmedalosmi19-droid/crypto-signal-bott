@@ -205,7 +205,6 @@ async def handle_activation_cb(update: Update, _context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    # الـ callbacks الخاصة بالتفعيل للأدمن فقط
     if not db.is_admin(query.from_user.id):
         return
 
@@ -260,6 +259,51 @@ async def handle_activation_cb(update: Update, _context: ContextTypes.DEFAULT_TY
 
 
 # ────────────────────────────────────────────────────────────
+# Callback: تدفّق التجديد من لوحة المشتركين (renew_ / rnwdur_)
+# ────────────────────────────────────────────────────────────
+async def handle_renew_cb(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not db.is_admin(query.from_user.id):
+        return
+
+    data = query.data
+
+    # ── زر تجديد: renew_<shop_id> → أزرار المدد ────────────
+    if data.startswith("renew_"):
+        shop_id  = int(data[6:])
+        shop     = db.get_shop(shop_id)
+        username = (shop["username"] if shop else None) or "بدون يوزر"
+        await query.edit_message_text(
+            f"🔄 تجديد: @{username} ({shop_id})\nاختر المدة:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("أسبوعان", callback_data=f"rnwdur_biweekly_{shop_id}"),
+                InlineKeyboardButton("شهر",    callback_data=f"rnwdur_monthly_{shop_id}"),
+                InlineKeyboardButton("سنة",    callback_data=f"rnwdur_yearly_{shop_id}"),
+            ]]),
+        )
+
+    # ── اختيار مدة: rnwdur_<plan>_<shop_id> → ولّد الكود ──
+    elif data.startswith("rnwdur_"):
+        _, plan, shop_id_str = data.split("_", 2)
+        shop_id  = int(shop_id_str)
+        shop     = db.get_shop(shop_id)
+        username = (shop["username"] if shop else None) or "بدون يوزر"
+        plan_ar  = PLAN_LABELS.get(plan, plan)
+
+        code = db.create_activation_code(shop_id, plan)
+        await query.edit_message_text(
+            f"✅ كود تجديد @{username} ({shop_id}) — {plan_ar}:\n\n"
+            f"{code}\n\n"
+            f"أرسل هذا الكود للمحل ليجدّد به.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 مدة أخرى", callback_data=f"renew_{shop_id}"),
+            ]]),
+        )
+
+
+# ────────────────────────────────────────────────────────────
 # إرسال كود التفعيل من المحل
 # ────────────────────────────────────────────────────────────
 async def handle_activation_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,11 +345,21 @@ async def show_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لا توجد محلات مسجّلة بعد.", reply_markup=ADMIN_KB)
         return
 
-    today = _date.today().isoformat()
-    lines = []
-    for s in shops:
-        end = s["end_date"] or ""
-        if s["status"] == "expired" or (s["status"] == "active" and end and end < today):
+    MAX_SHOPS = 20
+    shown     = shops[:MAX_SHOPS]
+    today     = _date.today().isoformat()
+
+    await update.message.reply_text(
+        f"📊 المشتركون ({len(shops)} محل — يُعرض {len(shown)}):",
+        reply_markup=ADMIN_KB,
+    )
+
+    for s in shown:
+        end        = s["end_date"] or ""
+        is_expired = s["status"] == "expired" or (
+            s["status"] == "active" and end and end < today
+        )
+        if is_expired:
             badge = "❌ منتهٍ"
         elif s["status"] == "active":
             badge = "✅ نشط"
@@ -314,23 +368,20 @@ async def show_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plan_ar  = PLAN_LABELS.get(s["plan"] or "", s["plan"] or "—")
         username = s["username"] or "بدون يوزر"
-        lines.append(
+        text = (
             f"{badge} @{username} ({s['telegram_id']})\n"
-            f"   الخطة: {plan_ar}  |  ينتهي: {end or '—'}  |  رسائل: {s['message_count']}"
+            f"الخطة: {plan_ar}  |  ينتهي: {end or '—'}  |  رسائل: {s['message_count']}"
         )
 
-    # إرسال على دفعات لتجنّب حدّ 4096 حرفاً
-    MAX = 4000
-    chunk = f"📊 المشتركون ({len(shops)}):\n\n"
-    for line in lines:
-        block = line + "\n\n"
-        if len(chunk) + len(block) > MAX:
-            await update.message.reply_text(chunk.rstrip(), reply_markup=ADMIN_KB)
-            chunk = block
+        # المنتظر بلا زر، الباقي بزر تجديد
+        if s["status"] == "pending":
+            kb = None
         else:
-            chunk += block
-    if chunk.strip():
-        await update.message.reply_text(chunk.rstrip(), reply_markup=ADMIN_KB)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 تجديد", callback_data=f"renew_{s['telegram_id']}")
+            ]])
+
+        await update.message.reply_text(text, reply_markup=kb)
 
 
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -578,6 +629,8 @@ app.add_handler(CommandHandler("exittest",   exittest))
 app.add_handler(CommandHandler("whoami",     whoami))
 # callbacks التفعيل: dur_ / gen_ / back_
 app.add_handler(CallbackQueryHandler(handle_activation_cb, pattern=r"^(dur|gen|back)_"))
+# callbacks التجديد: renew_ / rnwdur_
+app.add_handler(CallbackQueryHandler(handle_renew_cb,      pattern=r"^(renew|rnwdur)_"))
 app.add_handler(add_conv)
 app.add_handler(del_conv)
 app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"),             list_products))
@@ -589,3 +642,4 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,               ec
 
 print("Bot is running...")
 app.run_polling()
+
