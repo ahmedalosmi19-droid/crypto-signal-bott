@@ -657,5 +657,3 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,               ec
 
 print("Bot is running...")
 app.run_polling()
-
-
