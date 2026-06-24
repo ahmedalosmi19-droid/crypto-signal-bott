@@ -72,6 +72,16 @@ def init_db() -> None:
                 plan    TEXT    NOT NULL,
                 used    INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id          INTEGER NOT NULL REFERENCES shops(telegram_id),
+                product_code     TEXT,
+                customer_name    TEXT,
+                customer_phone   TEXT,
+                customer_address TEXT,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
 
         admin_id = os.environ.get("ADMIN_TELEGRAM_ID", "").strip()
@@ -80,7 +90,6 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO admin (telegram_id) VALUES (?)",
                 (int(admin_id),)
             )
-            # تحقق فوري من التسجيل
             registered = con.execute(
                 "SELECT telegram_id FROM admin WHERE telegram_id = ?", (int(admin_id),)
             ).fetchone()
@@ -96,7 +105,6 @@ def init_db() -> None:
 # الأدمن
 # ────────────────────────────────────────────────────────────
 def is_admin(telegram_id: int) -> bool:
-    """هل المعرّف في جدول الأدمن؟"""
     with _conn() as con:
         return con.execute(
             "SELECT 1 FROM admin WHERE telegram_id = ?", (telegram_id,)
@@ -104,7 +112,6 @@ def is_admin(telegram_id: int) -> bool:
 
 
 def get_admin_id() -> Optional[int]:
-    """جلب معرّف الأدمن الأول"""
     with _conn() as con:
         row = con.execute("SELECT telegram_id FROM admin LIMIT 1").fetchone()
         return row[0] if row else None
@@ -114,7 +121,6 @@ def get_admin_id() -> Optional[int]:
 # المحلات
 # ────────────────────────────────────────────────────────────
 def add_shop(telegram_id: int, username: Optional[str] = None) -> None:
-    """أضف محلاً أو تجاهل إن كان موجوداً"""
     with _conn() as con:
         con.execute(
             "INSERT OR IGNORE INTO shops (telegram_id, username) VALUES (?, ?)",
@@ -123,7 +129,6 @@ def add_shop(telegram_id: int, username: Optional[str] = None) -> None:
 
 
 def get_shop(telegram_id: int) -> Optional[dict]:
-    """اجلب بيانات محل بمعرّفه"""
     with _conn() as con:
         row = con.execute(
             "SELECT * FROM shops WHERE telegram_id = ?", (telegram_id,)
@@ -134,7 +139,6 @@ def get_shop(telegram_id: int) -> Optional[dict]:
 def cleanup_admin_shop(admin_id: int) -> None:
     """احذف بيانات المحل القديمة للأدمن (تنظيف لمرة واحدة عند التحويل)"""
     with _conn() as con:
-        # انقل أكواد سلع الأدمن إلى المتقاعدة
         rows = con.execute(
             "SELECT code FROM products WHERE shop_id = ?", (admin_id,)
         ).fetchall()
@@ -147,15 +151,15 @@ def cleanup_admin_shop(admin_id: int) -> None:
 
 
 def clear_test_shop(test_id: int) -> None:
-    """امسح بيانات محل الاختبار لبدء نظيف في كل جلسة"""
+    """امسح بيانات محل الاختبار يدوياً عبر /deleteinfo"""
     with _conn() as con:
+        con.execute("DELETE FROM orders WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM products WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM activation_codes WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM shops WHERE telegram_id = ?", (test_id,))
 
 
 def set_shop_active_unlimited(telegram_id: int) -> None:
-    """فعّل محلاً بلا تاريخ انتهاء (احتياطي)"""
     with _conn() as con:
         con.execute(
             "UPDATE shops SET status='active', plan='admin', start_date=date('now') "
@@ -165,7 +169,6 @@ def set_shop_active_unlimited(telegram_id: int) -> None:
 
 
 def increment_message_count(shop_id: int) -> None:
-    """زد عدّاد رسائل الزبائن"""
     with _conn() as con:
         con.execute(
             "UPDATE shops SET message_count = message_count + 1 WHERE telegram_id = ?",
@@ -179,7 +182,6 @@ def increment_message_count(shop_id: int) -> None:
 def create_activation_code(shop_id: int, plan: str) -> str:
     """ولّد كود تفعيل فريد (ACT-XXXXX) — يُبطل أي كود قديم غير مستخدم لنفس المحل أولاً"""
     with _conn() as con:
-        # كود واحد صالح فقط لكل محل في أي وقت
         con.execute(
             "DELETE FROM activation_codes WHERE shop_id = ? AND used = 0",
             (shop_id,)
@@ -199,7 +201,6 @@ def create_activation_code(shop_id: int, plan: str) -> str:
 
 
 def redeem_activation_code(code: str, shop_id: int) -> Optional[str]:
-    """تحقق من كود التفعيل وفعّل المحل. يُعيد اسم الخطة أو None إن فشل."""
     with _conn() as con:
         row = con.execute(
             "SELECT * FROM activation_codes WHERE code = ? AND shop_id = ? AND used = 0",
@@ -225,7 +226,6 @@ def redeem_activation_code(code: str, shop_id: int) -> Optional[str]:
 # السلع
 # ────────────────────────────────────────────────────────────
 def add_product(code: str, shop_id: int, name: str, price: float, sizes: list) -> None:
-    """أضف سلعة جديدة"""
     with _conn() as con:
         con.execute(
             "INSERT INTO products (code, shop_id, name, price, sizes) VALUES (?, ?, ?, ?, ?)",
@@ -234,7 +234,6 @@ def add_product(code: str, shop_id: int, name: str, price: float, sizes: list) -
 
 
 def get_product(code: str) -> Optional[dict]:
-    """اجلب سلعة بكودها"""
     with _conn() as con:
         row = con.execute(
             "SELECT * FROM products WHERE code = ?", (code,)
@@ -247,7 +246,6 @@ def get_product(code: str) -> Optional[dict]:
 
 
 def get_shop_products(shop_id: int) -> list:
-    """اجلب كل سلع محل معيّن"""
     with _conn() as con:
         rows = con.execute(
             "SELECT * FROM products WHERE shop_id = ?", (shop_id,)
@@ -261,7 +259,6 @@ def get_shop_products(shop_id: int) -> list:
 
 
 def delete_product(code: str, shop_id: int) -> bool:
-    """احذف السلعة إن كانت تخص هذا المحل، وانقل كودها للمتقاعدة"""
     with _conn() as con:
         affected = con.execute(
             "DELETE FROM products WHERE code = ? AND shop_id = ?", (code, shop_id)
@@ -277,7 +274,6 @@ def delete_product(code: str, shop_id: int) -> bool:
 # توليد كود السلعة
 # ────────────────────────────────────────────────────────────
 def generate_unique_code() -> str:
-    """ولّد كوداً فريداً عبر كل المنصّة (يتحقق من products و retired_codes)"""
     with _conn() as con:
         while True:
             prefix = "".join(random.choices(string.ascii_uppercase, k=2))
@@ -296,7 +292,7 @@ def generate_unique_code() -> str:
 # استعلامات لوحة الأدمن
 # ────────────────────────────────────────────────────────────
 def get_all_shops() -> list:
-    """كل المحلات مرتّبة: النشطة أولاً ثم المنتظرة ثم المنتهية، باستثناء الوهمية (ID سالب)"""
+    """كل المحلات مرتّبة — باستثناء الوهمية (ID سالب)"""
     with _conn() as con:
         rows = con.execute("""
             SELECT telegram_id, username, status, plan,
@@ -317,7 +313,6 @@ def get_all_shops() -> list:
 
 
 def get_platform_stats() -> dict:
-    """إحصاءات المنصّة: أعداد المحلات حسب الحالة وإجمالي السلع"""
     with _conn() as con:
         active = con.execute(
             "SELECT COUNT(*) FROM shops WHERE telegram_id > 0 "
@@ -342,7 +337,6 @@ def get_platform_stats() -> dict:
 
 
 def get_expiring_soon(days: int = 3) -> list:
-    """المحلات النشطة التي ينتهي اشتراكها خلال عدد الأيام المحدّد"""
     with _conn() as con:
         rows = con.execute("""
             SELECT telegram_id, username, end_date
@@ -358,7 +352,6 @@ def get_expiring_soon(days: int = 3) -> list:
 
 
 def is_subscription_active(shop_id: int) -> bool:
-    """هل اشتراك المحل ساري؟ (نشط وتاريخ انتهائه اليوم أو مستقبلاً أو بلا تاريخ)"""
     with _conn() as con:
         row = con.execute(
             "SELECT 1 FROM shops WHERE telegram_id = ? AND status = 'active' "
@@ -369,7 +362,7 @@ def is_subscription_active(shop_id: int) -> bool:
 
 
 def expire_overdue_shops() -> list:
-    """حدّث المحلات المنتهية إلى expired وأعد قائمة معرّفاتها (يُستثنى الوهمي)"""
+    """حدّث المحلات المنتهية إلى expired — يُستثنى الوهمي"""
     with _conn() as con:
         rows = con.execute(
             "SELECT telegram_id FROM shops "
@@ -390,15 +383,11 @@ def expire_overdue_shops() -> list:
 # ترحيل products.json
 # ────────────────────────────────────────────────────────────
 def migrate_from_json(json_path: str, owner_id: int) -> None:
-    """رحّل products.json إلى DB إن وُجد الملف، ثم أعد تسميته"""
     if not os.path.exists(json_path):
         return
-
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
     add_shop(owner_id)
-
     for code, p in data.get("products", {}).items():
         sizes = (
             p["sizes"] if isinstance(p["sizes"], list)
@@ -408,11 +397,40 @@ def migrate_from_json(json_path: str, owner_id: int) -> None:
             add_product(code, owner_id, p["name"], float(p["price"]), sizes)
         except Exception:
             pass
-
     with _conn() as con:
         for code in data.get("retired_codes", []):
             con.execute(
                 "INSERT OR IGNORE INTO retired_codes (code) VALUES (?)", (code,)
             )
-
     os.rename(json_path, json_path + ".migrated")
+
+
+# ────────────────────────────────────────────────────────────
+# الطلبات
+# ────────────────────────────────────────────────────────────
+def add_order(
+    shop_id: int,
+    product_code: str,
+    customer_name: str,
+    customer_phone: str,
+    customer_address: str,
+) -> None:
+    """سجّل طلب زبون جديد"""
+    with _conn() as con:
+        con.execute(
+            """INSERT INTO orders
+               (shop_id, product_code, customer_name, customer_phone, customer_address)
+               VALUES (?, ?, ?, ?, ?)""",
+            (shop_id, product_code, customer_name, customer_phone, customer_address),
+        )
+
+
+def get_shop_orders(shop_id: int) -> list:
+    """اجلب كل طلبات محل معيّن"""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM orders WHERE shop_id = ? ORDER BY created_at DESC",
+            (shop_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
