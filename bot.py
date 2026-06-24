@@ -156,9 +156,9 @@ async def _register_new_shop(
 # /whoami
 # ────────────────────────────────────────────────────────────
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    real_uid   = update.effective_chat.id
-    _is_admin  = db.is_admin(real_uid)
-    mode       = context.user_data.get("test_mode", "")
+    real_uid  = update.effective_chat.id
+    _is_admin = db.is_admin(real_uid)
+    mode      = context.user_data.get("test_mode", "")
     mode_label = {"shop": "محل 🏪", "customer": "زبون 🛍"}.get(mode, "غير نشط")
     await update.message.reply_text(
         f"🆔 معرّفك: {real_uid}\n"
@@ -232,7 +232,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username     = update.effective_user.username
     in_shop_test = context.user_data.get("test_mode") == TEST_SHOP
 
-    # أدمن خارج وضع محل الاختبار → كيبورد الأدمن
     if db.is_admin(real_uid) and not in_shop_test:
         await update.message.reply_text(
             "مرحباً أيها الأدمن.\n"
@@ -345,6 +344,42 @@ async def handle_renew_cb(update: Update, _context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔄 مدة أخرى", callback_data=f"renew_{shop_id}"),
             ]]),
         )
+
+
+# ────────────────────────────────────────────────────────────
+# Callback: قبول الطلب (accept_)
+# ────────────────────────────────────────────────────────────
+async def handle_accept_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query    = update.callback_query
+    await query.answer()
+    order_id = int(query.data.split("_")[1])
+    order    = db.get_order(order_id)
+    if order is None:
+        await query.answer("الطلب غير موجود.", show_alert=True)
+        return
+    presser = query.from_user.id
+    # تحقق أن الضاغط صاحب المحل أو الأدمن
+    if presser != abs(order["shop_id"]) and not db.is_admin(presser):
+        return
+    if order["status"] == "accepted":
+        await query.answer("الطلب مقبول مسبقاً.", show_alert=True)
+        return
+    db.mark_order_accepted(order_id)
+    # عدّل رسالة صاحب المحل وأزل الزر
+    try:
+        await query.edit_message_text(query.message.text + "\n\n✅ تم قبول الطلب")
+    except Exception:
+        pass
+    # أبلغ الزبون
+    customer_chat = order.get("customer_chat_id")
+    if customer_chat:
+        try:
+            await context.bot.send_message(
+                customer_chat,
+                "تمت رؤية طلبك من قبل المحل ✅ وسيتم التواصل معك قريباً."
+            )
+        except Exception:
+            pass
 
 
 # ────────────────────────────────────────────────────────────
@@ -606,9 +641,14 @@ async def _cust_order(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, shop_id: int
 ) -> None:
     name, phone, address = _parse_order(text)
-    product_code         = context.user_data.get("customer_last_product", "")
-    db.add_order(shop_id, product_code, name, phone, address)
-    real_chat = abs(shop_id)   # abs: المعرّف السالب → ID تيليجرام الحقيقي
+    product_code     = context.user_data.get("customer_last_product", "")
+    customer_chat_id = update.effective_chat.id
+    order_id = db.add_order(shop_id, product_code, name, phone, address, customer_chat_id)
+    # إشعار صاحب المحل مع زر القبول
+    real_chat = abs(shop_id)
+    accept_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ قبول الطلب", callback_data=f"accept_{order_id}")
+    ]])
     try:
         await context.bot.send_message(
             real_chat,
@@ -616,10 +656,23 @@ async def _cust_order(
             f"السلعة: {product_code or '—'}\n"
             f"الاسم: {name or '—'}\n"
             f"الهاتف: {phone or '—'}\n"
-            f"العنوان: {address or '—'}"
+            f"العنوان: {address or '—'}",
+            reply_markup=accept_kb,
         )
     except Exception:
         pass
+    # إشعار الأدمن
+    admin_id = db.get_admin_id()
+    if admin_id:
+        shop  = db.get_shop(shop_id)
+        uname = (shop["username"] if shop else None) or str(shop_id)
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"📩 محل @{uname} ({shop_id}) تلقّى طلباً جديداً من زبون."
+            )
+        except Exception:
+            pass
     await update.message.reply_text("تم استلام طلبك ✅ سيتواصل معك المحل قريباً.")
 
 
@@ -719,8 +772,8 @@ async def job_expiring_soon(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(application) -> None:
     jq = application.job_queue
-    jq.run_daily(job_expire_shops,  _time(0, 5))   # 00:05 UTC
-    jq.run_daily(job_expiring_soon, _time(0, 10))  # 00:10 UTC
+    jq.run_daily(job_expire_shops,  _time(0, 5))
+    jq.run_daily(job_expiring_soon, _time(0, 10))
 
 
 # ────────────────────────────────────────────────────────────
@@ -765,6 +818,8 @@ app.add_handler(CommandHandler("whoami",       whoami))
 app.add_handler(CallbackQueryHandler(handle_activation_cb, pattern=r"^(dur|gen|back)_"))
 # callbacks التجديد: renew_ / rnwdur_
 app.add_handler(CallbackQueryHandler(handle_renew_cb,      pattern=r"^(renew|rnwdur)_"))
+# callback قبول الطلب
+app.add_handler(CallbackQueryHandler(handle_accept_cb,     pattern=r"^accept_\d+$"))
 app.add_handler(add_conv)
 app.add_handler(del_conv)
 app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"),             list_products))
