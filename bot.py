@@ -19,6 +19,7 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     ConversationHandler,
+    PicklePersistence,
     filters,
 )
 
@@ -68,7 +69,7 @@ ADMIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 OWNER_KB = ReplyKeyboardMarkup(
-    [["➕ إضافة سلعة"], ["📋 عرض السلع", "🗑 حذف سلعة"]],
+    [["➕ إضافة سلعة"], ["📋 عرض السلع", "🗑 حذف سلعة"], ["🔔 الإشعارات"]],
     resize_keyboard=True,
 )
 
@@ -177,9 +178,10 @@ async def testclient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     test_id  = -uid
     username = update.effective_user.username
-    _exit_test_mode(context)
+    _exit_test_mode(context)                          # أنهِ أي وضع سابق
     context.user_data["test_mode"]    = TEST_SHOP
     context.user_data["test_shop_id"] = test_id
+    # سجّل المحل إن لم يكن موجوداً (بلا حذف تلقائي)
     shop = db.get_shop(test_id)
     if shop is None:
         display_name = f"test_{username or uid}"
@@ -197,9 +199,9 @@ async def testcustomer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     if not db.is_admin(uid):
         return
-    _exit_test_mode(context)
+    _exit_test_mode(context)                          # أنهِ أي وضع سابق
     context.user_data["test_mode"]    = TEST_CUSTOMER
-    context.user_data["test_shop_id"] = -uid
+    context.user_data["test_shop_id"] = -uid          # يراسل محل الاختبار الوهمي
     await update.message.reply_text(
         f"🛍 وضع محاكاة الزبون نشط — رسائلك تصل للمحل الوهمي ({-uid})\n"
         "استعمل /exittest للخروج.",
@@ -232,6 +234,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username     = update.effective_user.username
     in_shop_test = context.user_data.get("test_mode") == TEST_SHOP
 
+    # أدمن خارج وضع محل الاختبار → كيبورد الأدمن
     if db.is_admin(real_uid) and not in_shop_test:
         await update.message.reply_text(
             "مرحباً أيها الأدمن.\n"
@@ -402,6 +405,37 @@ async def handle_activation_code(update: Update, context: ContextTypes.DEFAULT_T
         f"✅ تم تفعيل اشتراكك ({plan_ar} — ينتهي {shop['end_date']})",
         reply_markup=OWNER_KB,
     )
+
+
+# ────────────────────────────────────────────────────────────
+# إشعارات صاحب المحل
+# ────────────────────────────────────────────────────────────
+async def show_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _eff_uid(update, context)
+    if not can_manage(uid):
+        await _deny_pending(update, context)
+        return
+    notifs = db.get_shop_notifications(uid)
+    if not notifs:
+        await update.message.reply_text("لا توجد إشعارات بعد.", reply_markup=OWNER_KB)
+        return
+    icon = {"order": "🛒", "inquiry": "❓"}
+    lines = [
+        f"{icon.get(n['kind'], '📌')} {n['content']}\n🕐 {n['created_at']}"
+        for n in notifs
+    ]
+    # تقسيم الرسالة إن تجاوزت حد تيليجرام
+    chunk, chunks = [], []
+    for line in lines:
+        if sum(len(l) for l in chunk) + len(line) > 3800:
+            chunks.append(chunk)
+            chunk = []
+        chunk.append(line)
+    if chunk:
+        chunks.append(chunk)
+    for i, ch in enumerate(chunks):
+        kb = OWNER_KB if i == len(chunks) - 1 else None
+        await update.message.reply_text("\n\n".join(ch), reply_markup=kb)
 
 
 # ────────────────────────────────────────────────────────────
@@ -580,7 +614,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ────────────────────────────────────────────────────────────
-# echo
+# echo (زبائن/محلات غير مفعّلة)
 # ────────────────────────────────────────────────────────────
 async def echo(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"أنت كتبت: {update.message.text}")
@@ -630,7 +664,7 @@ async def _cust_product(
         f"📦 {product['name']}\n"
         f"💰 السعر: {product['price']}\n"
         f"📐 القياسات: {sizes}\n"
-        f"📌 الحالة: متوفر"
+        f"📌 الحالة: متوفر"          # يمكن ربطها بمخزون لاحقاً
     )
     await update.message.reply_text(
         "لو حابب تطلب، أرسل:\nالاسم / رقم الهاتف / العنوان"
@@ -644,7 +678,10 @@ async def _cust_order(
     product_code     = context.user_data.get("customer_last_product", "")
     customer_chat_id = update.effective_chat.id
     order_id = db.add_order(shop_id, product_code, name, phone, address, customer_chat_id)
-    # إشعار صاحب المحل مع زر القبول
+    # حفظ إشعار دائم في قاعدة البيانات
+    notif_content = f"الاسم: {name or '—'} | الهاتف: {phone or '—'} | العنوان: {address or '—'} | السلعة: {product_code or '—'}"
+    db.add_notification(shop_id, "order", notif_content, customer_chat_id)
+    # إشعار فوري لصاحب المحل مع زر القبول
     real_chat = abs(shop_id)
     accept_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ قبول الطلب", callback_data=f"accept_{order_id}")
@@ -659,9 +696,9 @@ async def _cust_order(
             f"العنوان: {address or '—'}",
             reply_markup=accept_kb,
         )
-    except Exception:
-        pass
-    # إشعار الأدمن
+    except Exception as e:
+        logging.error("[_cust_order] فشل إرسال إشعار المحل %s: %s", real_chat, e)
+    # إشعار فوري للأدمن
     admin_id = db.get_admin_id()
     if admin_id:
         shop  = db.get_shop(shop_id)
@@ -671,8 +708,8 @@ async def _cust_order(
                 admin_id,
                 f"📩 محل @{uname} ({shop_id}) تلقّى طلباً جديداً من زبون."
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("[_cust_order] فشل إرسال إشعار الأدمن: %s", e)
     await update.message.reply_text("تم استلام طلبك ✅ سيتواصل معك المحل قريباً.")
 
 
@@ -681,13 +718,16 @@ async def _cust_inquiry(
 ) -> None:
     real_chat   = abs(shop_id)
     customer_id = update.effective_chat.id
+    # حفظ إشعار دائم في قاعدة البيانات
+    db.add_notification(shop_id, "inquiry", text, customer_id)
+    # إشعار فوري لصاحب المحل
     try:
         await context.bot.send_message(
             real_chat,
             f"❓ استفسار من زبون\n{text}\nالمعرّف: {customer_id}"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error("[_cust_inquiry] فشل إرسال الاستفسار للمحل %s: %s", real_chat, e)
     await update.message.reply_text("تم إرسال سؤالك للمحل.")
 
 
@@ -698,9 +738,9 @@ async def handle_customer_message(
     shop_id = context.user_data.get("test_shop_id")
     if not shop_id:
         return
-    text    = update.message.text.strip()
-    text_up = text.upper()
+    text = update.message.text.strip()
     db.increment_message_count(shop_id)
+    text_up = text.upper()
     if _RE_GREETING.match(text):
         await _cust_greet(update, context, shop_id)
     elif m := _RE_PRODUCT.search(text_up):
@@ -716,9 +756,9 @@ async def _customer_interceptor(
 ) -> None:
     """اعترض رسائل وضع الزبون في المجموعة -1 قبل أي معالج آخر"""
     if context.user_data.get("test_mode") != TEST_CUSTOMER:
-        return
+        return                         # ليس وضع زبون → أكمل لمعالجات المجموعة 0
     await handle_customer_message(update, context)
-    raise ApplicationHandlerStop
+    raise ApplicationHandlerStop       # أوقف المعالجة لهذه الرسالة
 
 
 # ────────────────────────────────────────────────────────────
@@ -772,14 +812,16 @@ async def job_expiring_soon(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(application) -> None:
     jq = application.job_queue
-    jq.run_daily(job_expire_shops,  _time(0, 5))
-    jq.run_daily(job_expiring_soon, _time(0, 10))
+    jq.run_daily(job_expire_shops,  _time(0, 5))   # 00:05 UTC
+    jq.run_daily(job_expiring_soon, _time(0, 10))  # 00:10 UTC
 
 
 # ────────────────────────────────────────────────────────────
 # تجميع البوت
 # ────────────────────────────────────────────────────────────
-app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
+# الحفظ الدائم لـ user_data وbot_data عبر إعادة التشغيل (Railway)
+persistence = PicklePersistence(filepath="bot_persistence")
+app = ApplicationBuilder().token(TOKEN).persistence(persistence).post_init(_post_init).build()
 
 add_conv = ConversationHandler(
     entry_points=[MessageHandler(filters.Regex(r"^➕ إضافة سلعة$"), add_start)],
@@ -823,6 +865,7 @@ app.add_handler(CallbackQueryHandler(handle_accept_cb,     pattern=r"^accept_\d+
 app.add_handler(add_conv)
 app.add_handler(del_conv)
 app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"),             list_products))
+app.add_handler(MessageHandler(filters.Regex(r"^🔔 الإشعارات$"),        show_notifications))
 app.add_handler(MessageHandler(filters.Regex(r"^📊 المشتركون$"),       show_subscribers))
 app.add_handler(MessageHandler(filters.Regex(r"^📈 إحصاءات المنصّة$"), show_stats))
 # كود التفعيل يُعالَج قبل echo
