@@ -77,23 +77,24 @@ OWNER_KB = ReplyKeyboardMarkup(
 # ────────────────────────────────────────────────────────────
 # مساعدات عامة
 # ────────────────────────────────────────────────────────────
-def _eff_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """يُعيد المعرّف الوهمي في وضع محل الاختبار فقط"""
-    if context.user_data.get("test_mode") == TEST_SHOP:
-        return context.user_data["test_shop_id"]
-    return update.effective_chat.id
+def _eff_uid(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    """يُعيد المعرّف الوهمي في وضع محل الاختبار (من قاعدة البيانات)"""
+    real_uid = update.effective_chat.id
+    state = db.get_admin_mode(real_uid)
+    if state["mode"] == TEST_SHOP:
+        return state["test_shop_id"]
+    return real_uid
 
 
 def _clear_conv(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """احذف مفاتيح المحادثة مع الحفاظ على حالة الاختبار"""
+    """احذف مفاتيح المحادثة المؤقتة (اسم/سعر/قياسات)"""
     for key in ("name", "price", "sizes"):
         context.user_data.pop(key, None)
 
 
-def _exit_test_mode(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """أنهِ أي وضع اختبار نشط وامسح مفاتيحه"""
-    for key in ("test_mode", "test_shop_id", "customer_last_product"):
-        context.user_data.pop(key, None)
+def _exit_test_mode(uid: int) -> None:
+    """أنهِ وضع الاختبار في قاعدة البيانات"""
+    db.clear_admin_mode(uid)
 
 
 def can_manage(uid: int) -> bool:
@@ -156,10 +157,11 @@ async def _register_new_shop(
 # ────────────────────────────────────────────────────────────
 # /whoami
 # ────────────────────────────────────────────────────────────
-async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def whoami(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     real_uid  = update.effective_chat.id
     _is_admin = db.is_admin(real_uid)
-    mode      = context.user_data.get("test_mode", "")
+    state     = db.get_admin_mode(real_uid)
+    mode      = state["mode"] or ""
     mode_label = {"shop": "محل 🏪", "customer": "زبون 🛍"}.get(mode, "غير نشط")
     await update.message.reply_text(
         f"🆔 معرّفك: {real_uid}\n"
@@ -178,10 +180,8 @@ async def testclient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     test_id  = -uid
     username = update.effective_user.username
-    _exit_test_mode(context)                          # أنهِ أي وضع سابق
-    context.user_data["test_mode"]    = TEST_SHOP
-    context.user_data["test_shop_id"] = test_id
-    # سجّل المحل إن لم يكن موجوداً (بلا حذف تلقائي)
+    _exit_test_mode(uid)
+    db.set_admin_mode(uid, TEST_SHOP, test_id)
     shop = db.get_shop(test_id)
     if shop is None:
         display_name = f"test_{username or uid}"
@@ -194,14 +194,13 @@ async def testclient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def testcustomer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def testcustomer(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """/testcustomer — وضع محاكاة الزبون"""
     uid = update.effective_chat.id
     if not db.is_admin(uid):
         return
-    _exit_test_mode(context)                          # أنهِ أي وضع سابق
-    context.user_data["test_mode"]    = TEST_CUSTOMER
-    context.user_data["test_shop_id"] = -uid          # يراسل محل الاختبار الوهمي
+    _exit_test_mode(uid)
+    db.set_admin_mode(uid, TEST_CUSTOMER, -uid)
     await update.message.reply_text(
         f"🛍 وضع محاكاة الزبون نشط — رسائلك تصل للمحل الوهمي ({-uid})\n"
         "استعمل /exittest للخروج.",
@@ -209,20 +208,20 @@ async def testcustomer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def exittest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def exittest(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """/exittest — خروج من أي وضع اختبار بلا حذف بيانات"""
     if not db.is_admin(update.effective_chat.id):
         return
-    _exit_test_mode(context)
+    _exit_test_mode(update.effective_chat.id)
     await update.message.reply_text("خرجت من وضع الاختبار.", reply_markup=ADMIN_KB)
 
 
-async def deleteinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def deleteinfo(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """/deleteinfo — حذف يدوي لكل بيانات محل الاختبار"""
     uid = update.effective_chat.id
     if not db.is_admin(uid):
         return
-    db.clear_test_shop(-uid)
+    db.clear_test_shop(-uid)  # يحذف admin_state أيضاً داخلياً
     await update.message.reply_text("🧹 حُذفت بيانات الاختبار.")
 
 
@@ -232,7 +231,8 @@ async def deleteinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     real_uid     = update.effective_chat.id
     username     = update.effective_user.username
-    in_shop_test = context.user_data.get("test_mode") == TEST_SHOP
+    state        = db.get_admin_mode(real_uid)
+    in_shop_test = state["mode"] == TEST_SHOP
 
     # أدمن خارج وضع محل الاختبار → كيبورد الأدمن
     if db.is_admin(real_uid) and not in_shop_test:
@@ -441,9 +441,10 @@ async def show_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ────────────────────────────────────────────────────────────
 # لوحة الأدمن
 # ────────────────────────────────────────────────────────────
-async def show_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if not db.is_admin(uid) or context.user_data.get("test_mode"):
+async def show_subscribers(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    uid   = update.effective_chat.id
+    state = db.get_admin_mode(uid)
+    if not db.is_admin(uid) or state["mode"]:
         await update.message.reply_text(f"أنت كتبت: {update.message.text}")
         return
     shops = db.get_all_shops()
@@ -475,9 +476,10 @@ async def show_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=kb)
 
 
-async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if not db.is_admin(uid) or context.user_data.get("test_mode"):
+async def show_stats(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    uid   = update.effective_chat.id
+    state = db.get_admin_mode(uid)
+    if not db.is_admin(uid) or state["mode"]:
         await update.message.reply_text(f"أنت كتبت: {update.message.text}")
         return
     s = db.get_platform_stats()
@@ -652,19 +654,20 @@ async def _cust_greet(update: Update, _context: ContextTypes.DEFAULT_TYPE, _shop
 
 
 async def _cust_product(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, shop_id: int
+    update: Update, _context: ContextTypes.DEFAULT_TYPE, code: str, shop_id: int
 ) -> None:
     product = db.get_product(code)
     if product is None or product["shop_id"] != shop_id:
         await update.message.reply_text("لم أجد هذا الكود، تأكّد منه.")
         return
-    context.user_data["customer_last_product"] = code
+    # احفظ آخر سلعة في قاعدة البيانات بدل الذاكرة المؤقتة
+    db.set_admin_last_product(update.effective_chat.id, code)
     sizes = ", ".join(product["sizes"])
     await update.message.reply_text(
         f"📦 {product['name']}\n"
         f"💰 السعر: {product['price']}\n"
         f"📐 القياسات: {sizes}\n"
-        f"📌 الحالة: متوفر"          # يمكن ربطها بمخزون لاحقاً
+        f"📌 الحالة: متوفر"
     )
     await update.message.reply_text(
         "لو حابب تطلب، أرسل:\nالاسم / رقم الهاتف / العنوان"
@@ -675,11 +678,16 @@ async def _cust_order(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, shop_id: int
 ) -> None:
     name, phone, address = _parse_order(text)
-    product_code     = context.user_data.get("customer_last_product", "")
-    customer_chat_id = update.effective_chat.id
+    real_uid         = update.effective_chat.id
+    state            = db.get_admin_mode(real_uid)
+    product_code     = state.get("last_product") or ""
+    customer_chat_id = real_uid
     order_id = db.add_order(shop_id, product_code, name, phone, address, customer_chat_id)
     # حفظ إشعار دائم في قاعدة البيانات
-    notif_content = f"الاسم: {name or '—'} | الهاتف: {phone or '—'} | العنوان: {address or '—'} | السلعة: {product_code or '—'}"
+    notif_content = (
+        f"الاسم: {name or '—'} | الهاتف: {phone or '—'} | "
+        f"العنوان: {address or '—'} | السلعة: {product_code or '—'}"
+    )
     db.add_notification(shop_id, "order", notif_content, customer_chat_id)
     # إشعار فوري لصاحب المحل مع زر القبول
     real_chat = abs(shop_id)
@@ -734,13 +742,15 @@ async def _cust_inquiry(
 async def handle_customer_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """نقطة دخول موحّدة لرسائل الزبون — مستقلة عن المصدر"""
-    shop_id = context.user_data.get("test_shop_id")
+    """نقطة دخول موحّدة لرسائل الزبون — تقرأ الحالة من قاعدة البيانات"""
+    real_uid = update.effective_chat.id
+    state    = db.get_admin_mode(real_uid)
+    shop_id  = state["test_shop_id"]
     if not shop_id:
         return
-    text = update.message.text.strip()
-    db.increment_message_count(shop_id)
+    text    = update.message.text.strip()
     text_up = text.upper()
+    db.increment_message_count(shop_id)
     if _RE_GREETING.match(text):
         await _cust_greet(update, context, shop_id)
     elif m := _RE_PRODUCT.search(text_up):
@@ -754,11 +764,13 @@ async def handle_customer_message(
 async def _customer_interceptor(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """اعترض رسائل وضع الزبون في المجموعة -1 قبل أي معالج آخر"""
-    if context.user_data.get("test_mode") != TEST_CUSTOMER:
-        return                         # ليس وضع زبون → أكمل لمعالجات المجموعة 0
+    """اعترض رسائل وضع الزبون — يتحقق من قاعدة البيانات لا الذاكرة"""
+    real_uid = update.effective_chat.id
+    state    = db.get_admin_mode(real_uid)
+    if state["mode"] != TEST_CUSTOMER:
+        return
     await handle_customer_message(update, context)
-    raise ApplicationHandlerStop       # أوقف المعالجة لهذه الرسالة
+    raise ApplicationHandlerStop
 
 
 # ────────────────────────────────────────────────────────────
@@ -812,14 +824,14 @@ async def job_expiring_soon(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(application) -> None:
     jq = application.job_queue
-    jq.run_daily(job_expire_shops,  _time(0, 5))   # 00:05 UTC
-    jq.run_daily(job_expiring_soon, _time(0, 10))  # 00:10 UTC
+    jq.run_daily(job_expire_shops,  _time(0, 5))
+    jq.run_daily(job_expiring_soon, _time(0, 10))
 
 
 # ────────────────────────────────────────────────────────────
 # تجميع البوت
 # ────────────────────────────────────────────────────────────
-# الحفظ الدائم لـ user_data وbot_data عبر إعادة التشغيل (Railway)
+# PicklePersistence للـ ConversationHandler (اسم/سعر/قياسات) فقط
 persistence = PicklePersistence(filepath="bot_persistence")
 app = ApplicationBuilder().token(TOKEN).persistence(persistence).post_init(_post_init).build()
 
@@ -862,15 +874,3 @@ app.add_handler(CallbackQueryHandler(handle_activation_cb, pattern=r"^(dur|gen|b
 app.add_handler(CallbackQueryHandler(handle_renew_cb,      pattern=r"^(renew|rnwdur)_"))
 # callback قبول الطلب
 app.add_handler(CallbackQueryHandler(handle_accept_cb,     pattern=r"^accept_\d+$"))
-app.add_handler(add_conv)
-app.add_handler(del_conv)
-app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"),             list_products))
-app.add_handler(MessageHandler(filters.Regex(r"^🔔 الإشعارات$"),        show_notifications))
-app.add_handler(MessageHandler(filters.Regex(r"^📊 المشتركون$"),       show_subscribers))
-app.add_handler(MessageHandler(filters.Regex(r"^📈 إحصاءات المنصّة$"), show_stats))
-# كود التفعيل يُعالَج قبل echo
-app.add_handler(MessageHandler(filters.Regex(r"^ACT-[A-Z0-9]{5}$"),    handle_activation_code))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,         echo))
-
-print("Bot is running...")
-app.run_polling()
