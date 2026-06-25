@@ -874,3 +874,14 @@ app.add_handler(CallbackQueryHandler(handle_activation_cb, pattern=r"^(dur|gen|b
 app.add_handler(CallbackQueryHandler(handle_renew_cb,      pattern=r"^(renew|rnwdur)_"))
 # callback قبول الطلب
 app.add_handler(CallbackQueryHandler(handle_accept_cb,     pattern=r"^accept_\d+$"))
+app.add_handler(add_conv)
+app.add_handler(del_conv)
+app.add_handler(MessageHandler(filters.Regex(r"^📋 عرض السلع$"),             list_products))
+app.add_handler(MessageHandler(filters.Regex(r"^🔔 الإشعارات$"),        show_notifications))
+app.add_handler(MessageHandler(filters.Regex(r"^📊 المشتركون$"),       show_subscribers))
+app.add_handler(MessageHandler(filters.Regex(r"^📈 إحصاءات المنصّة$"), show_stats))
+app.add_handler(MessageHandler(filters.Regex(r"^ACT-[A-Z0-9]{5}$"),    handle_activation_code))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,         echo))
+
+print("Bot is running...")
+app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
