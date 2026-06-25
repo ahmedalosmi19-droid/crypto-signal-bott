@@ -93,6 +93,13 @@ def init_db() -> None:
                 customer_id INTEGER,
                 created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS admin_state (
+                admin_id     INTEGER PRIMARY KEY,
+                mode         TEXT,
+                test_shop_id INTEGER,
+                last_product TEXT
+            );
         """)
 
         # أضف الأعمدة الجديدة آمناً على قواعد بيانات قائمة
@@ -176,7 +183,9 @@ def cleanup_admin_shop(admin_id: int) -> None:
 
 def clear_test_shop(test_id: int) -> None:
     """امسح بيانات محل الاختبار يدوياً عبر /deleteinfo"""
+    admin_id = -test_id  # test_id سالب = -admin_id
     with _conn() as con:
+        con.execute("DELETE FROM admin_state WHERE admin_id = ?", (admin_id,))
         con.execute("DELETE FROM notifications WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM orders WHERE shop_id = ?", (test_id,))
         con.execute("DELETE FROM products WHERE shop_id = ?", (test_id,))
@@ -487,6 +496,75 @@ def mark_order_accepted(order_id: int) -> None:
         con.execute(
             "UPDATE orders SET status = 'accepted' WHERE id = ?", (order_id,)
         )
+
+
+def add_notification(shop_id: int, kind: str, content: str, customer_id: int) -> None:
+    """خزّن إشعار زبون (طلب أو استفسار)"""
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO notifications (shop_id, kind, content, customer_id) VALUES (?, ?, ?, ?)",
+            (shop_id, kind, content, customer_id),
+        )
+
+
+def get_shop_notifications(shop_id: int, limit: int = 20) -> list:
+    """اجلب آخر إشعارات محل معيّن بالأحدث أولاً"""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM notifications WHERE shop_id = ? ORDER BY created_at DESC LIMIT ?",
+            (shop_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ────────────────────────────────────────────────────────────
+# حالة الأدمن (مشتركة بين النسخ وثابتة عبر الإعادة)
+# ────────────────────────────────────────────────────────────
+def set_admin_mode(admin_id: int, mode: str, test_shop_id: int = None) -> None:
+    """احفظ وضع الاختبار للأدمن (UPSERT) — يصفّر last_product عند التبديل"""
+    with _conn() as con:
+        con.execute(
+            """INSERT INTO admin_state (admin_id, mode, test_shop_id, last_product)
+               VALUES (?, ?, ?, NULL)
+               ON CONFLICT(admin_id) DO UPDATE SET
+                   mode         = excluded.mode,
+                   test_shop_id = excluded.test_shop_id,
+                   last_product = NULL""",
+            (admin_id, mode, test_shop_id),
+        )
+
+
+def get_admin_mode(admin_id: int) -> dict:
+    """اجلب وضع الأدمن — يُعيد dict دائماً (القيم قد تكون None)"""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT mode, test_shop_id, last_product FROM admin_state WHERE admin_id = ?",
+            (admin_id,),
+        ).fetchone()
+    if row:
+        return {
+            "mode":         row["mode"],
+            "test_shop_id": row["test_shop_id"],
+            "last_product": row["last_product"],
+        }
+    return {"mode": None, "test_shop_id": None, "last_product": None}
+
+
+def set_admin_last_product(admin_id: int, code: str) -> None:
+    """حدّث آخر سلعة استُعلم عنها الزبون"""
+    with _conn() as con:
+        con.execute(
+            """INSERT INTO admin_state (admin_id, last_product)
+               VALUES (?, ?)
+               ON CONFLICT(admin_id) DO UPDATE SET last_product = excluded.last_product""",
+            (admin_id, code),
+        )
+
+
+def clear_admin_mode(admin_id: int) -> None:
+    """احذف صف الحالة عند الخروج من وضع الاختبار"""
+    with _conn() as con:
+        con.execute("DELETE FROM admin_state WHERE admin_id = ?", (admin_id,))
 
 
 def get_shop_orders(shop_id: int) -> list:
